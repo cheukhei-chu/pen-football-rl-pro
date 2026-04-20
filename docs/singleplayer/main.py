@@ -3,6 +3,8 @@ import pygame
 import json
 import math
 import random
+import sys
+from urllib.parse import parse_qs
 
 # Import the game - we'll need a numpy-free version for Pygbag
 try:
@@ -14,15 +16,60 @@ except:
 
 # --- PURE PYTHON NEURAL NETWORK (NO NUMPY) ---
 W = {}
+BOT_MANIFEST = {"default_bot": None, "bots": []}
+CURRENT_BOT = {"name": "Default", "rating": None}
+
+def load_bot_manifest():
+    global BOT_MANIFEST
+    try:
+        with open("assets/bots_manifest.json", "r") as f:
+            BOT_MANIFEST = json.load(f)
+    except:
+        BOT_MANIFEST = {"default_bot": None, "bots": []}
+
+def get_selected_bot_id():
+    if sys.platform != "emscripten":
+        return None
+    try:
+        import platform
+        search = str(platform.window.location.search or "")
+        params = parse_qs(search.lstrip("?"))
+        values = params.get("bot", [])
+        return values[0] if values else None
+    except:
+        return None
+
+def get_bot_by_id(bot_id):
+    for bot in BOT_MANIFEST.get("bots", []):
+        if bot["id"] == bot_id:
+            return bot
+    return None
 
 def load_weights():
-    global W
+    global W, CURRENT_BOT
+    load_bot_manifest()
+    selected_bot_id = get_selected_bot_id() or BOT_MANIFEST.get("default_bot")
+    bot = get_bot_by_id(selected_bot_id) if selected_bot_id else None
+    weights_path = "assets/model_weights.json"
+    if bot:
+        weights_path = bot.get("weights_path", weights_path)
+        CURRENT_BOT = {
+            "name": bot.get("name", "Bot"),
+            "rating": bot.get("rating"),
+        }
+    else:
+        CURRENT_BOT = {"name": "Default", "rating": None}
+
     try:
-        with open("assets/model_weights.json", "r") as f:
+        with open(weights_path, "r") as f:
             W = json.load(f)
-        print("Weights loaded successfully.")
+        if bot and CURRENT_BOT["rating"] is not None:
+            print(f"Weights loaded for {CURRENT_BOT['name']} (BT {CURRENT_BOT['rating']:.2f}).")
+        else:
+            print("Weights loaded successfully.")
     except:
-        print("WARNING: model_weights.json not found! AI will play randomly.")
+        print(f"WARNING: Could not load {weights_path}! AI will play randomly.")
+        CURRENT_BOT = {"name": "Random", "rating": None}
 
 def dot_product(vec, mat):
     """Matrix multiply: vec (N,) * mat^T (MxN) = result (M,)
@@ -123,6 +170,7 @@ async def main():
     game.height = BASE_HEIGHT * SCALE
 
     load_weights()
+    info_font = pygame.font.SysFont("consolas", 14 * SCALE)
 
     running = True
     while running:
@@ -152,6 +200,12 @@ async def main():
             game.reset()
 
         game.render()
+        rating_suffix = ""
+        if CURRENT_BOT["rating"] is not None:
+            rating_suffix = f"  |  BT {CURRENT_BOT['rating']:.0f}"
+        label = info_font.render(f"Opponent: {CURRENT_BOT['name']}{rating_suffix}", True, (20, 20, 20))
+        screen.blit(label, (10, game.height - label.get_height() - 8))
+        pygame.display.flip()
         clock.tick(TICK_RATE)
 
         await asyncio.sleep(0)

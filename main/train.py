@@ -1,12 +1,37 @@
+import argparse
+import copy
+import json
+import os
+import random
+from collections import deque, defaultdict
+
+import numpy as np
+import pygame
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import os, time, pygame, random
 
 from multiagent import FootballMultiAgentEnv
 from policy import *
-from collections import deque, defaultdict
+
+
+def result_to_score(result):
+    if result == "red":
+        return 1.0
+    if result == "blue":
+        return 0.0
+    if result == "draw":
+        return 0.5
+    return None
+
+
+def load_or_create_policy(policy):
+    if isinstance(policy, tuple):
+        pname, kwargs = policy
+        return make_policy(pname, **kwargs), kwargs
+
+    loaded_policy, checkpoint = policy_from_checkpoint_path(policy)
+    return loaded_policy, checkpoint.get("policy_kwargs", {})
 
 ###############################################################
 # =======================  GAE  ============================= #
@@ -32,8 +57,19 @@ def compute_gae(rewards, values, dones, last_val, gamma=0.99, lam=0.95):
 # ====================  PPO LOSS  =========================== #
 ###############################################################
 
-def ppo_loss(policy, obs, actions, old_logps, advantages, returns,
-             clip_ratio=0.2, vf_coef=0.5, ent_coef=0.01):
+def ppo_loss(
+    policy,
+    obs,
+    actions,
+    old_logps,
+    advantages,
+    returns,
+    old_values=None,
+    clip_ratio=0.2,
+    vf_coef=0.5,
+    ent_coef=0.01,
+    vf_clip_ratio=0.2,
+):
 
     logits = policy.forward(obs)
 
@@ -50,14 +86,35 @@ def ppo_loss(policy, obs, actions, old_logps, advantages, returns,
 
     # Ensure old_logps, advantages, returns are tensors of matching shape
     # ratio shape: (batch,)
-    ratio = torch.exp(logp - old_logps)
+    log_ratio = logp - old_logps
+    ratio = torch.exp(log_ratio)
     clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
     policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
 
     value_pred = logits["value"].squeeze(-1)
-    value_loss = ((returns - value_pred) ** 2).mean()
+    if old_values is not None and vf_clip_ratio is not None:
+        value_pred_clipped = old_values + torch.clamp(
+            value_pred - old_values,
+            -vf_clip_ratio,
+            vf_clip_ratio,
+        )
+        value_loss_unclipped = (returns - value_pred) ** 2
+        value_loss_clipped = (returns - value_pred_clipped) ** 2
+        value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+    else:
+        value_loss = 0.5 * ((returns - value_pred) ** 2).mean()
 
-    return policy_loss + vf_coef * value_loss - ent_coef * entropy.mean()
+    loss = policy_loss + vf_coef * value_loss - ent_coef * entropy.mean()
+    approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
+    clip_fraction = ((ratio - 1.0).abs() > clip_ratio).float().mean().item()
+    metrics = {
+        "policy_loss": policy_loss.item(),
+        "value_loss": value_loss.item(),
+        "entropy": entropy.mean().item(),
+        "approx_kl": approx_kl,
+        "clip_fraction": clip_fraction,
+    }
+    return loss, metrics
 
 
 ###############################################################
@@ -73,6 +130,7 @@ def rollout(env, policy_red, policy_blue, select_drill,
     rew_list = []
     done_list = []
     val_list = []
+    episode_scores = []
 
     steps = 0
     obs = None
@@ -133,7 +191,7 @@ def rollout(env, policy_red, policy_blue, select_drill,
             done = terminated["__all__"] or truncated["__all__"]
 
             r_ext = rewards["player_red"]
-            r_worker = r_ext # Worker Base
+            r_worker = r_ext
 
             if is_feudal:
                 # Worker gets Mixed (Extrinsic + Intrinsic)
@@ -151,12 +209,17 @@ def rollout(env, policy_red, policy_blue, select_drill,
             for k in a:
                 act_list[k].append(a[k])           # list of ints
             logp_list.append(logp)                 # list of floats
-            rew_list.append(rewards["player_red"]) # list of floats
+            rew_list.append(r_worker)              # list of floats
             done_list.append(done)                 # list of bools
             val_list.append(value)                 # list of floats
 
             steps += 1
             obs = next_obs
+
+            if done:
+                score = result_to_score(info.get("result"))
+                if score is not None:
+                    episode_scores.append(score)
 
             # if we've reached rollout_len exactly mid-episode, break cleanly
             if steps >= rollout_len:
@@ -181,7 +244,7 @@ def rollout(env, policy_red, policy_blue, select_drill,
     result = {
         "obs": obs_list, "acts": act_list, "logp": logp_list,
         "rew": rew_list, "val": val_list, "done": done_list,
-        "last_val": w_last_val
+        "last_val": w_last_val, "episode_scores": episode_scores
     }
 
     # NEW: Return Manager data if it exists
@@ -199,8 +262,25 @@ def rollout(env, policy_red, policy_blue, select_drill,
 # ===================  PPO UPDATE  ========================== #
 ###############################################################
 
-def ppo_update(policy, optimizer, obs, actions, old_logps, advantages, returns, manager_data=None,
-               epochs=10, batch_size=64, clip_ratio=0.2):
+def ppo_update(
+    policy,
+    optimizer,
+    obs,
+    actions,
+    old_logps,
+    advantages,
+    returns,
+    old_values=None,
+    manager_data=None,
+    epochs=10,
+    batch_size=64,
+    clip_ratio=0.2,
+    vf_coef=0.5,
+    ent_coef=0.01,
+    vf_clip_ratio=0.2,
+    target_kl=None,
+    max_grad_norm=None,
+):
     """
     obs: list of (1,obs_dim) tensors OR a stacked tensor (N, obs_dim)
     actions: dict of lists -> will be converted to tensors
@@ -220,18 +300,23 @@ def ppo_update(policy, optimizer, obs, actions, old_logps, advantages, returns, 
     }
 
     old_logps = torch.tensor(old_logps, dtype=torch.float32)
-    advantages = advantages.clone().detach().requires_grad_(True)
-    returns = returns.clone().detach().requires_grad_(True)
+    old_values = None if old_values is None else torch.tensor(old_values, dtype=torch.float32)
+    advantages = advantages.clone().detach()
+    returns = returns.clone().detach()
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     if manager_data:
-        m_obs = obs # Manager sees same obs
         m_goals = torch.cat(manager_data["raw_goals"], dim=0)
         m_old_logps = torch.cat(manager_data["m_logp"], dim=0)
-        m_adv = manager_data["m_adv"]
-        m_ret = manager_data["m_ret"]
+        m_adv = manager_data["m_adv"].clone().detach()
+        m_adv = (m_adv - m_adv.mean()) / (m_adv.std() + 1e-8)
+        m_ret = manager_data["m_ret"].clone().detach()
+        m_old_values = torch.tensor(manager_data["m_old_values"], dtype=torch.float32)
 
     N = len(returns)
     idxs = np.arange(N)
+    metrics_accum = defaultdict(list)
+    early_stop = False
 
     # ---------- PPO training ----------
     for _ in range(epochs):
@@ -251,35 +336,201 @@ def ppo_update(policy, optimizer, obs, actions, old_logps, advantages, returns, 
             old_log_b = old_logps[batch_idx]
             adv_b = advantages[batch_idx]
             ret_b = returns[batch_idx]
+            old_val_b = None if old_values is None else old_values[batch_idx]
 
-            loss = ppo_loss(
-                policy, obs_b, act_b, old_log_b, adv_b, ret_b, clip_ratio
+            loss, loss_metrics = ppo_loss(
+                policy,
+                obs_b,
+                act_b,
+                old_log_b,
+                adv_b,
+                ret_b,
+                old_values=old_val_b,
+                clip_ratio=clip_ratio,
+                vf_coef=vf_coef,
+                ent_coef=ent_coef,
+                vf_clip_ratio=vf_clip_ratio,
             )
+            for key, value in loss_metrics.items():
+                metrics_accum[key].append(value)
 
             if manager_data:
                 m_goals_b = m_goals[batch_idx]
                 m_old_log_b = m_old_logps[batch_idx]
                 m_adv_b = m_adv[batch_idx]
                 m_ret_b = m_ret[batch_idx]
+                m_old_val_b = m_old_values[batch_idx]
 
                 # Get new stats
                 m_logp_new, m_ent_new, m_val_pred = policy.evaluate_manager(obs_b, m_goals_b)
                 m_val_pred = m_val_pred.squeeze(-1)
 
                 # Standard PPO Ratio
-                m_ratio = torch.exp(m_logp_new - m_old_log_b)
+                m_log_ratio = m_logp_new - m_old_log_b
+                m_ratio = torch.exp(m_log_ratio)
                 m_surr1 = m_ratio * m_adv_b
                 m_surr2 = torch.clamp(m_ratio, 1-clip_ratio, 1+clip_ratio) * m_adv_b
 
                 m_loss_pi = -torch.min(m_surr1, m_surr2).mean()
-                m_loss_v = ((m_ret_b - m_val_pred) ** 2).mean()
+                if vf_clip_ratio is not None:
+                    m_val_pred_clipped = m_old_val_b + torch.clamp(
+                        m_val_pred - m_old_val_b,
+                        -vf_clip_ratio,
+                        vf_clip_ratio,
+                    )
+                    m_v_loss_unclipped = (m_ret_b - m_val_pred) ** 2
+                    m_v_loss_clipped = (m_ret_b - m_val_pred_clipped) ** 2
+                    m_loss_v = 0.5 * torch.max(m_v_loss_unclipped, m_v_loss_clipped).mean()
+                else:
+                    m_loss_v = 0.5 * ((m_ret_b - m_val_pred) ** 2).mean()
+                m_approx_kl = ((m_ratio - 1.0) - m_log_ratio).mean().item()
 
                 # ADD LOSSES TOGETHER
                 loss += (m_loss_pi + 0.5 * m_loss_v - 0.01 * m_ent_new.mean())
+                metrics_accum["manager_policy_loss"].append(m_loss_pi.item())
+                metrics_accum["manager_value_loss"].append(m_loss_v.item())
+                metrics_accum["manager_entropy"].append(m_ent_new.mean().item())
+                metrics_accum["manager_approx_kl"].append(m_approx_kl)
 
             optimizer.zero_grad()
             loss.backward()
+            if max_grad_norm is not None:
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+                metrics_accum["grad_norm"].append(float(grad_norm))
             optimizer.step()
+
+            if target_kl is not None and loss_metrics["approx_kl"] > target_kl:
+                early_stop = True
+                break
+        if early_stop:
+            break
+
+    return {
+        key: float(np.mean(values))
+        for key, values in metrics_accum.items()
+        if len(values) > 0
+    }
+
+
+def reset_policy_state(policy):
+    if hasattr(policy, "reset_state"):
+        policy.reset_state()
+
+
+def set_optimizer_lr(optimizer, lr):
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def linear_schedule(start, end, progress):
+    progress = min(max(progress, 0.0), 1.0)
+    return start + (end - start) * progress
+
+
+def save_policy_checkpoint(path, policy, policy_kwargs):
+    torch.save({
+        "policy_state_dict": policy.state_dict(),
+        "policy_class": policy.__class__.__name__,
+        "policy_kwargs": policy_kwargs,
+    }, path)
+
+
+def load_policy_cached(identifier, fixed_opponents, policy_cache):
+    if identifier in fixed_opponents:
+        return fixed_opponents[identifier]
+
+    if identifier not in policy_cache:
+        loaded_policy, _ = policy_from_checkpoint_path(identifier)
+        loaded_policy.eval()
+        policy_cache[identifier] = loaded_policy
+
+    return policy_cache[identifier]
+
+
+def play_evaluation_round(env, red_policy, blue_policy, max_steps=600):
+    reset_policy_state(red_policy)
+    reset_policy_state(blue_policy)
+
+    env.set_setting(None)
+    obs, _ = env.reset()
+    done = False
+    steps = 0
+
+    while not done and steps < max_steps:
+        with torch.no_grad():
+            a_red = red_policy.sample_action(obs["player_red"])
+            a_blue = blue_policy.sample_action(obs["player_blue"])
+
+        obs, _, terminated, truncated, info = env.step({
+            "player_red": a_red,
+            "player_blue": a_blue,
+        })
+        done = terminated["__all__"] or truncated["__all__"]
+        steps += 1
+
+        if done:
+            return info.get("result", "draw")
+
+    return "draw"
+
+
+def evaluate_matchup(candidate_policy, opponent_policy, games=20, max_steps=600):
+    env = FootballMultiAgentEnv()
+    scores = []
+
+    for game_idx in range(games):
+        if game_idx % 2 == 0:
+            result = play_evaluation_round(env, candidate_policy, opponent_policy, max_steps=max_steps)
+            score = result_to_score(result)
+        else:
+            result = play_evaluation_round(env, opponent_policy, candidate_policy, max_steps=max_steps)
+            score = 1.0 - result_to_score(result)
+
+        scores.append(score)
+
+    env.close()
+    return {
+        "mean_score": float(np.mean(scores)) if scores else 0.5,
+        "win_rate": float(np.mean([s == 1.0 for s in scores])) if scores else 0.0,
+        "draw_rate": float(np.mean([s == 0.5 for s in scores])) if scores else 0.0,
+        "loss_rate": float(np.mean([s == 0.0 for s in scores])) if scores else 0.0,
+        "games": games,
+    }
+
+
+def sample_weighted(items, weights):
+    total = sum(weights)
+    if total <= 0:
+        return random.choice(items)
+    return random.choices(items, weights=weights, k=1)[0]
+
+
+def pfsp_weight(score, min_weight=1e-3):
+    score = min(max(score, 0.0), 1.0)
+    return max(min_weight, 4.0 * score * (1.0 - score))
+
+
+def hard_weight(score, min_weight=1e-3):
+    score = min(max(score, 0.0), 1.0)
+    return max(min_weight, 1.0 - score)
+
+
+def parse_policy_spec(policy_checkpoint, policy_class, policy_kwargs_json):
+    if policy_checkpoint:
+        return policy_checkpoint
+
+    if not policy_class:
+        raise ValueError("Either --policy-checkpoint or --policy-class must be provided.")
+
+    try:
+        policy_kwargs = json.loads(policy_kwargs_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid --policy-kwargs JSON: {exc}") from exc
+
+    if not isinstance(policy_kwargs, dict):
+        raise ValueError("--policy-kwargs must decode to a JSON object.")
+
+    return (policy_class, policy_kwargs)
 
 
 ###############################################################
@@ -298,14 +549,7 @@ def train_drill_ppo(name, policy, select_drill,
     checkpoint_dir = os.path.join(parent_dir, "checkpoints", name)
     os.makedirs(checkpoint_dir, exist_ok=False)
 
-    # Load or construct policy
-    if isinstance(policy, tuple):
-        pname, kwargs = policy
-        policy_red = make_policy(pname, **kwargs)
-        policy_kwargs = kwargs
-    else:
-        policy_red, checkpoint = policy_from_checkpoint_path(policy)
-        policy_kwargs = checkpoint["policy_kwargs"]
+    policy_red, policy_kwargs = load_or_create_policy(policy)
 
     policy_blue = DummyPolicy()
     optimizer = optim.Adam(policy_red.parameters(), lr=lr)
@@ -339,6 +583,7 @@ def train_drill_ppo(name, policy, select_drill,
         ppo_update(
             policy_red, optimizer,
             obs, actions, old_logps, adv, ret,
+            old_values=values,
             epochs=epochs, batch_size=batch_size
         )
 
@@ -374,13 +619,7 @@ def train_league_ppo(
     checkpoint_dir = os.path.join(parent_dir, "checkpoints", name)
     os.makedirs(checkpoint_dir, exist_ok=False)
 
-    if isinstance(policy, tuple):
-        pname, kwargs = policy
-        policy_red = make_policy(pname, **kwargs)
-        policy_kwargs = kwargs
-    else:
-        policy_red, checkpoint = policy_from_checkpoint_path(policy)
-        policy_kwargs = checkpoint["policy_kwargs"]
+    policy_red, policy_kwargs = load_or_create_policy(policy)
 
     optimizer = optim.Adam(policy_red.parameters(), lr=lr)
 
@@ -435,6 +674,7 @@ def train_league_ppo(
         ppo_update(
             policy_red, optimizer,
             obs, actions, old_logps, adv, ret,
+            old_values=values,
             epochs=epochs, batch_size=batch_size
         )
 
@@ -466,12 +706,31 @@ def train_league_ppo_real(
     lr=3e-4, gamma=0.99, lam=0.95,
     epochs=10, batch_size=256,
     pool_size=10000,
-    self_play_prob=None,
     print_every=10_000, save_every=50_000,
-    eval_win_window=20,         # number of recent matches to track per opponent
-    difficulty_alpha=2.0,       # skew exponent for weighting (>=1 -> more skew)
-    min_opponent_weight=1e-3,   # don't let weight go to zero
-    opponent_pool=[],
+    eval_win_window=20,
+    opponent_pool=None,
+    fixed_benchmarks=("dummy", "atul"),
+    fixed_opponent_prob=0.15,
+    champion_prob=0.20,
+    recent_prob=0.15,
+    pfsp_prob=0.30,
+    hard_prob=0.20,
+    recent_window=12,
+    promotion_games=40,
+    benchmark_games=20,
+    historical_eval_opponents=4,
+    historical_eval_games=10,
+    promotion_threshold=0.55,
+    benchmark_threshold=0.50,
+    historical_threshold=0.50,
+    target_kl=0.02,
+    max_grad_norm=0.5,
+    vf_clip_ratio=0.2,
+    ent_coef_start=0.01,
+    ent_coef_end=0.001,
+    lr_end=3e-5,
+    max_round_steps=600,
+    save_rejected_checkpoints=False,
 ):
     env = FootballMultiAgentEnv()
 
@@ -480,96 +739,186 @@ def train_league_ppo_real(
     checkpoint_dir = os.path.join(parent_dir, "checkpoints", name)
     os.makedirs(checkpoint_dir, exist_ok=False)
 
-    # Load or construct policy
-    if isinstance(policy, tuple):
-        pname, kwargs = policy
-        policy_red = make_policy(pname, **kwargs)
-        policy_kwargs = kwargs
-    else:
-        policy_red, checkpoint = policy_from_checkpoint_path(policy)
-        policy_kwargs = checkpoint.get("policy_kwargs", {})
-
+    policy_red, policy_kwargs = load_or_create_policy(policy)
     optimizer = optim.Adam(policy_red.parameters(), lr=lr)
-
-    # ---------- Opponent pool + bookkeeping ----------
-    # opponent_pool = []  # list of checkpoint file paths
-    # For each opponent checkpoint path we keep a deque of last eval_win_window results (1 = learner win, 0 = loss)
     win_history = defaultdict(lambda: deque(maxlen=eval_win_window))
 
-    if self_play_prob is None:
-        self_play_prob = 1.0 / (pool_size + 1)
+    fixed_opponents = {}
+    if "dummy" in fixed_benchmarks:
+        fixed_opponents["dummy"] = DummyPolicy()
+        fixed_opponents["dummy"].eval()
+    if "atul" in fixed_benchmarks:
+        fixed_opponents["atul"] = atulPolicy()
+        fixed_opponents["atul"].eval()
 
-    def compute_win_rate(opponent_path):
-        hist = win_history.get(opponent_path, None)
-        if hist is None or len(hist) == 0:
-            return 0.5  # unknown opponents treated as 50/50 initially
-        return float(sum(hist)) / len(hist)
-
-    def opponent_weight(opponent_path):
-        # weight should be higher when learner has LOWER win rate vs that opponent
-        win_rate = compute_win_rate(opponent_path)
-        difficulty = 1.0 - win_rate
-        # exponentiate to control skew; ensure nonzero
-        return max(min_opponent_weight, (difficulty ** difficulty_alpha))
-
-    def select_opponent_weighted():
-        # If no opponents yet, return DummyPolicy
-        if len(opponent_pool) == 0:
-            return None  # signal to use DummyPolicy
-
-        # With small probability pick self (self-play)
-        if random.random() < self_play_prob:
-            return "self"
-
-        # weighted sample from opponent_pool by difficulty
-        weights = [opponent_weight(p) for p in opponent_pool]
-        total = sum(weights)
-        if total <= 0:
-            # fallback to uniform
-            choice = random.choice(opponent_pool)
-            return choice
-        probs = [w / total for w in weights]
-        choice = random.choices(opponent_pool, weights=probs, k=1)[0]
-        return choice
-
-    def load_opponent_from_path(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        if "policy_kwargs" in ckpt:
-            opponent = make_policy(ckpt["policy_class"], **ckpt["policy_kwargs"])
+    policy_cache = {}
+    historical_pool = []
+    if opponent_pool is None:
+        opponent_pool = []
+    for path in opponent_pool:
+        if os.path.exists(path):
+            historical_pool.append(path)
         else:
-            opponent = make_policy(ckpt["policy_class"])
-        opponent.load_state_dict(ckpt["policy_state_dict"])
-        opponent.eval()
-        return opponent
+            print(f"[WARN] Skipping missing opponent checkpoint: {path}")
 
-    def record_result_vs_opponent(opponent_path, learner_score):
-        """
-        learner_score: numeric performance metric from rollout vs opponent (higher = better).
-        For simplicity we treat learner_score > 0 as win; customize as needed.
-        """
-        if opponent_path is None or opponent_path == "self":
+    champion_path = policy if isinstance(policy, str) and os.path.exists(policy) else None
+    if champion_path is not None and champion_path not in historical_pool:
+        historical_pool.append(champion_path)
+
+    recent_promotions = deque(maxlen=recent_window)
+    if champion_path is not None:
+        recent_promotions.append(champion_path)
+
+    def mean_score_against(identifier):
+        history = win_history.get(identifier)
+        if history is None or len(history) == 0:
+            return 0.5
+        return float(sum(history)) / len(history)
+
+    def record_episode_scores(identifier, episode_scores):
+        if identifier is None:
             return
-        win = 1 if learner_score > 0 else 0
-        win_history[opponent_path].append(win)
+        for score in episode_scores:
+            win_history[identifier].append(float(score))
 
-    # ---------- training loop ----------
+    def trim_historical_pool():
+        while len(historical_pool) > pool_size:
+            removable = None
+            for candidate_path in historical_pool:
+                if candidate_path != champion_path:
+                    removable = candidate_path
+                    break
+            if removable is None:
+                break
+            historical_pool.remove(removable)
+            if removable in recent_promotions:
+                recent_promotions.remove(removable)
+            policy_cache.pop(removable, None)
+            win_history.pop(removable, None)
+
+    def select_opponent_identifier():
+        categories = []
+        historical_candidates = [p for p in historical_pool if p != champion_path]
+        recent_candidates = [p for p in recent_promotions if p != champion_path]
+
+        if fixed_opponents:
+            categories.append(("fixed", fixed_opponent_prob))
+        if champion_path is not None:
+            categories.append(("champion", champion_prob))
+        if recent_candidates:
+            categories.append(("recent", recent_prob))
+        if historical_candidates:
+            categories.append(("pfsp", pfsp_prob))
+            categories.append(("hard", hard_prob))
+
+        if not categories:
+            return "dummy" if "dummy" in fixed_opponents else None
+
+        names = [name for name, _ in categories]
+        probs = [prob for _, prob in categories]
+        category = sample_weighted(names, probs)
+
+        if category == "fixed":
+            return random.choice(list(fixed_opponents.keys()))
+        if category == "champion":
+            return champion_path
+        if category == "recent":
+            return random.choice(recent_candidates)
+        if category == "pfsp":
+            weights = [pfsp_weight(mean_score_against(path)) for path in historical_candidates]
+            return sample_weighted(historical_candidates, weights)
+        if category == "hard":
+            weights = [hard_weight(mean_score_against(path)) for path in historical_candidates]
+            return sample_weighted(historical_candidates, weights)
+
+        return None
+
+    def evaluate_for_promotion(step):
+        candidate_policy = make_policy(policy_red.__class__.__name__, **policy_kwargs)
+        candidate_policy.load_state_dict(copy.deepcopy(policy_red.state_dict()))
+        candidate_policy.eval()
+
+        summary = {
+            "step": step,
+            "overall_score": 0.5,
+            "champion_score": None,
+            "benchmark_scores": {},
+            "historical_score": None,
+            "promoted": False,
+        }
+
+        suite_scores = []
+
+        if champion_path is not None:
+            champion_policy = load_policy_cached(champion_path, fixed_opponents, policy_cache)
+            champion_result = evaluate_matchup(
+                candidate_policy,
+                champion_policy,
+                games=promotion_games,
+                max_steps=max_round_steps,
+            )
+            summary["champion_score"] = champion_result["mean_score"]
+            suite_scores.append(champion_result["mean_score"])
+
+        for benchmark_name in fixed_opponents:
+            result = evaluate_matchup(
+                candidate_policy,
+                fixed_opponents[benchmark_name],
+                games=benchmark_games,
+                max_steps=max_round_steps,
+            )
+            summary["benchmark_scores"][benchmark_name] = result["mean_score"]
+            suite_scores.append(result["mean_score"])
+
+        historical_candidates = [p for p in historical_pool if p != champion_path]
+        if historical_candidates:
+            sample_size = min(historical_eval_opponents, len(historical_candidates))
+            sampled_paths = random.sample(historical_candidates, sample_size)
+            historical_scores = []
+            for opponent_path in sampled_paths:
+                opponent_policy = load_policy_cached(opponent_path, fixed_opponents, policy_cache)
+                result = evaluate_matchup(
+                    candidate_policy,
+                    opponent_policy,
+                    games=historical_eval_games,
+                    max_steps=max_round_steps,
+                )
+                historical_scores.append(result["mean_score"])
+            summary["historical_score"] = float(np.mean(historical_scores))
+            suite_scores.append(summary["historical_score"])
+
+        if suite_scores:
+            summary["overall_score"] = float(np.mean(suite_scores))
+
+        passes = True
+        if summary["champion_score"] is not None:
+            passes &= summary["champion_score"] >= promotion_threshold
+        for benchmark_score in summary["benchmark_scores"].values():
+            passes &= benchmark_score >= benchmark_threshold
+        if summary["historical_score"] is not None:
+            passes &= summary["historical_score"] >= historical_threshold
+        passes &= summary["overall_score"] >= benchmark_threshold
+
+        summary["promoted"] = passes
+        return summary
+
     steps = 0
     rewards_save = []
+    score_save = []
+    stats_save = []
 
     while steps < total_steps:
-        # pick and load opponent
-        opp_choice = select_opponent_weighted()
-        if opp_choice is None:
-            policy_blue = DummyPolicy()
-            opp_path_for_record = None
-        elif opp_choice == "self":
-            policy_blue = policy_red
-            opp_path_for_record = "self"
-        else:
-            policy_blue = load_opponent_from_path(opp_choice)
-            opp_path_for_record = opp_choice
+        progress = steps / max(total_steps, 1)
+        curr_lr = linear_schedule(lr, lr_end, progress)
+        curr_ent_coef = linear_schedule(ent_coef_start, ent_coef_end, progress)
+        set_optimizer_lr(optimizer, curr_lr)
 
-        # -------- GET ROLLOUT DATA --------
+        opponent_id = select_opponent_identifier()
+        if opponent_id is None:
+            policy_blue = DummyPolicy()
+        else:
+            policy_blue = load_policy_cached(opponent_id, fixed_opponents, policy_cache)
+
         roll = rollout(
             env,
             policy_red,
@@ -586,11 +935,9 @@ def train_league_ppo_real(
         dones    = roll["done"]
         values   = roll["val"]
         last_val = roll["last_val"]
+        episode_scores = roll.get("episode_scores", [])
 
-        # Compute a simple scalar metric of learner performance vs opponent over this rollout:
-        # you can replace this with per-episode result processing if you want.
-        learner_score = float(np.mean(rewards))  # average time-step reward across rollout
-        record_result_vs_opponent(opp_path_for_record, learner_score)
+        record_episode_scores(opponent_id, episode_scores)
 
         steps += rollout_len
 
@@ -608,41 +955,78 @@ def train_league_ppo_real(
                 "raw_goals": roll["raw_goals"],
                 "m_logp": roll["m_logp"],
                 "m_adv": m_adv,
-                "m_ret": m_ret
+                "m_ret": m_ret,
+                "m_old_values": roll["m_val"],
             }
 
-        ppo_update(
+        train_metrics = ppo_update(
             policy_red, optimizer,
-            obs, actions, old_logps, adv, ret, manager_data=manager_data,
-            epochs=epochs, batch_size=batch_size
+            obs, actions, old_logps, adv, ret,
+            old_values=values,
+            manager_data=manager_data,
+            epochs=epochs,
+            batch_size=batch_size,
+            clip_ratio=0.2,
+            ent_coef=curr_ent_coef,
+            vf_clip_ratio=vf_clip_ratio,
+            target_kl=target_kl,
+            max_grad_norm=max_grad_norm,
         )
 
         rewards_save.append(sum(rewards)/len(rewards))
+        if episode_scores:
+            score_save.append(float(np.mean(episode_scores)))
+        stats_save.append(train_metrics)
         if steps % print_every < rollout_len:
-            print(f"[{steps - (steps % print_every)}] PPO update | mean reward = {sum(rewards_save)/len(rewards_save):.3f}")
-            rewards_save = []
+            mean_metrics = {}
+            if stats_save:
+                metric_keys = stats_save[0].keys()
+                for key in metric_keys:
+                    mean_metrics[key] = float(np.mean([stats[key] for stats in stats_save if key in stats]))
 
-        # ---------- periodic save & add to pool ----------
-        if steps % save_every < rollout_len:
-            save_path = os.path.join(
-                checkpoint_dir,
-                f"checkpoint_{steps - (steps % save_every)}.pth"
+            print(
+                f"[{steps - (steps % print_every)}] "
+                f"mean reward = {sum(rewards_save)/len(rewards_save):.3f} | "
+                f"mean episode score = {np.mean(score_save) if score_save else 0.5:.3f} | "
+                f"lr = {curr_lr:.6f} | ent = {curr_ent_coef:.4f} | "
+                f"approx_kl = {mean_metrics.get('approx_kl', 0.0):.4f} | "
+                f"clipfrac = {mean_metrics.get('clip_fraction', 0.0):.3f}"
             )
-            torch.save({
-                "policy_state_dict": policy_red.state_dict(),
-                "policy_class": policy_red.__class__.__name__,
-                "policy_kwargs": policy_kwargs
-            }, save_path)
+            rewards_save = []
+            score_save = []
+            stats_save = []
 
-            print(f"Saved checkpoint to {save_path}")
+        if steps % save_every < rollout_len:
+            checkpoint_step = steps - (steps % save_every)
+            summary = evaluate_for_promotion(checkpoint_step)
 
-            # add to opponent pool
-            opponent_pool.append(save_path)
-            if len(opponent_pool) > pool_size:
-                # drop oldest from both pool and win_history
-                removed = opponent_pool.pop(0)
-                if removed in win_history:
-                    del win_history[removed]
+            if summary["promoted"]:
+                save_path = os.path.join(checkpoint_dir, f"checkpoint_{checkpoint_step}.pth")
+                save_policy_checkpoint(save_path, policy_red, policy_kwargs)
+                champion_path = save_path
+                policy_cache[save_path] = load_policy_cached(save_path, fixed_opponents, policy_cache)
+                historical_pool.append(save_path)
+                recent_promotions.append(save_path)
+                trim_historical_pool()
+
+                print(
+                    f"Promoted checkpoint at step {checkpoint_step} | "
+                    f"overall = {summary['overall_score']:.3f} | "
+                    f"champion = {summary['champion_score'] if summary['champion_score'] is not None else float('nan'):.3f} | "
+                    f"benchmarks = {summary['benchmark_scores']} | "
+                    f"historical = {summary['historical_score'] if summary['historical_score'] is not None else float('nan'):.3f}"
+                )
+            else:
+                if save_rejected_checkpoints:
+                    save_path = os.path.join(checkpoint_dir, f"candidate_{checkpoint_step}.pth")
+                    save_policy_checkpoint(save_path, policy_red, policy_kwargs)
+                print(
+                    f"Rejected checkpoint at step {checkpoint_step} | "
+                    f"overall = {summary['overall_score']:.3f} | "
+                    f"champion = {summary['champion_score'] if summary['champion_score'] is not None else float('nan'):.3f} | "
+                    f"benchmarks = {summary['benchmark_scores']} | "
+                    f"historical = {summary['historical_score'] if summary['historical_score'] is not None else float('nan'):.3f}"
+                )
 
 
 ###############################################################
@@ -650,48 +1034,69 @@ def train_league_ppo_real(
 ###############################################################
 
 if __name__ == "__main__":
-    # train_drill_ppo(
-    #     name="misc_drill",
-    #     policy=("CurriculumMLPPolicy", {}),
-    #     select_drill=lambda: random.choices([
-    #         {"drill": "block"},
-    #         {"drill": "block_nobounce"},
-    #         {"drill": "shoot_left", "par": random.uniform(-1, -40/150)},
-    #         {"drill": "shoot_right", "par": random.uniform(-1, -40/150)},
-    #         {"drill": "hit_left_wall", "par": random.uniform(-40/150, 1)},
-    #         {"drill": "hit_right_wall", "par": random.uniform(-40/150, 1)},
-    #         {"drill": "volley", "par": random.uniform(-0.9, 0.3)},
-    #         {"drill": "prepare", "par": random.uniform(-1, 1)},
-    #     ],
-    #     [0.1, 0.2, 0.15, 0.15, 0.1, 0.1, 0.1, 0.1],
-    #     )[0],
-    #     total_steps=30_000_000,
-    #     rollout_len=2048,
-    #     print_every=10_000,
-    #     save_every=100_000,
-    # )
-    # train_league_ppo(
-    #     name="league_ppo_regular (score reward)",
-    #     policy=("RegularMLPPolicy", {}),
-    #     total_steps=30_000_000,
-    #     rollout_len=2048,
-    #     print_every=10_000,
-    #     save_every=100_000,
-    # )
-    train_league_ppo_real(
-        name="league_ppo_real_warmstart_experts",
-        policy="../checkpoints/league_ppo (misc rewards)/checkpoint_7100000.pth",
-        total_steps=300_000_000,
-        rollout_len=2048,
-        print_every=10_000,
-        save_every=1_000_000,
-        opponent_pool=[
-            *[f"../checkpoints/league_ppo (misc rewards)/checkpoint_{i}00000.pth" for i in range(1, 301)],
-            *[f"../checkpoints/league_ppo (score reward)/checkpoint_{i}00000.pth" for i in range(1, 301)],
-            *[f"../checkpoints/league_ppo_real (score reward)/checkpoint_{i}00000.pth" for i in range(1, 138)],
-            *[f"../checkpoints/league_ppo_regular_real (misc rewards)/checkpoint_{i}00000.pth" for i in range(1, 151)],
-            *[f"../checkpoints/league_ppo_regular_real (misc rewards)/checkpoint_{i}00000.pth" for i in range(1, 151)],
-            *[f"../checkpoints/league_ppo_regular_real (score reward) (latent_dims 128 128)/checkpoint_{i}00000.pth" for i in range(1, 151)],
-            *[f"../checkpoints/shoot_left_ppo (without embedding)/checkpoint_{i*16384}.pth" for i in range(1, 184)],
-        ],
-    )
+    parser = argparse.ArgumentParser(description="Train Pen Football agents.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    stable_parser = subparsers.add_parser("league-stable", help="Run the stabilized league PPO trainer.")
+    stable_parser.add_argument("--name", required=True, help="Checkpoint folder name to create under ../checkpoints.")
+    policy_group = stable_parser.add_mutually_exclusive_group(required=True)
+    policy_group.add_argument("--policy-checkpoint", help="Warm-start from an existing checkpoint.")
+    policy_group.add_argument("--policy-class", help="Create a fresh policy by class name, e.g. ActorCriticMLPPolicy.")
+    stable_parser.add_argument("--policy-kwargs", default="{}", help="JSON object of kwargs for --policy-class.")
+    stable_parser.add_argument("--total-steps", type=int, default=30_000_000)
+    stable_parser.add_argument("--rollout-len", type=int, default=2048)
+    stable_parser.add_argument("--lr", type=float, default=3e-4)
+    stable_parser.add_argument("--lr-end", type=float, default=3e-5)
+    stable_parser.add_argument("--epochs", type=int, default=10)
+    stable_parser.add_argument("--batch-size", type=int, default=256)
+    stable_parser.add_argument("--pool-size", type=int, default=200)
+    stable_parser.add_argument("--print-every", type=int, default=10_000)
+    stable_parser.add_argument("--save-every", type=int, default=1_000_000)
+    stable_parser.add_argument("--promotion-games", type=int, default=40)
+    stable_parser.add_argument("--benchmark-games", type=int, default=20)
+    stable_parser.add_argument("--historical-eval-opponents", type=int, default=4)
+    stable_parser.add_argument("--historical-eval-games", type=int, default=10)
+    stable_parser.add_argument("--promotion-threshold", type=float, default=0.55)
+    stable_parser.add_argument("--benchmark-threshold", type=float, default=0.50)
+    stable_parser.add_argument("--historical-threshold", type=float, default=0.50)
+    stable_parser.add_argument("--target-kl", type=float, default=0.02)
+    stable_parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    stable_parser.add_argument("--vf-clip-ratio", type=float, default=0.2)
+    stable_parser.add_argument("--ent-coef-start", type=float, default=0.01)
+    stable_parser.add_argument("--ent-coef-end", type=float, default=0.001)
+    stable_parser.add_argument("--fixed-benchmarks", nargs="*", default=["dummy", "atul"])
+    stable_parser.add_argument("--seed-pool", nargs="*", default=[], help="Optional list of checkpoint paths to seed the historical pool.")
+    stable_parser.add_argument("--save-rejected-checkpoints", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.command == "league-stable":
+        policy_spec = parse_policy_spec(args.policy_checkpoint, args.policy_class, args.policy_kwargs)
+        train_league_ppo_real(
+            name=args.name,
+            policy=policy_spec,
+            total_steps=args.total_steps,
+            rollout_len=args.rollout_len,
+            lr=args.lr,
+            lr_end=args.lr_end,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            pool_size=args.pool_size,
+            print_every=args.print_every,
+            save_every=args.save_every,
+            promotion_games=args.promotion_games,
+            benchmark_games=args.benchmark_games,
+            historical_eval_opponents=args.historical_eval_opponents,
+            historical_eval_games=args.historical_eval_games,
+            promotion_threshold=args.promotion_threshold,
+            benchmark_threshold=args.benchmark_threshold,
+            historical_threshold=args.historical_threshold,
+            target_kl=args.target_kl,
+            max_grad_norm=args.max_grad_norm,
+            vf_clip_ratio=args.vf_clip_ratio,
+            ent_coef_start=args.ent_coef_start,
+            ent_coef_end=args.ent_coef_end,
+            fixed_benchmarks=tuple(args.fixed_benchmarks),
+            opponent_pool=args.seed_pool,
+            save_rejected_checkpoints=args.save_rejected_checkpoints,
+        )
