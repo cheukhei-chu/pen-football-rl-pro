@@ -1,0 +1,71 @@
+{
+  "default_bot": "champion_1953",
+  "bots": [
+    {
+      "id": "rookie_1621",
+      "name": "Rookie",
+      "display_label": "BT 1621",
+      "rating_system": "bt_rating",
+      "rating": 1621.39,
+      "conservative_rating": 1600.78,
+      "elo": 1516.13,
+      "weights_path": "assets/bots/rookie_1621.json",
+      "source_label": "league_stable_seeded_checkpoint_5000000.pth"
+    },
+    {
+      "id": "club_1661",
+      "name": "Club",
+      "display_label": "BT 1661",
+      "rating_system": "bt_rating",
+      "rating": 1660.98,
+      "conservative_rating": 1640.27,
+      "elo": 1741.86,
+      "weights_path": "assets/bots/club_1661.json",
+      "source_label": "league_stable_seeded_checkpoint_6000000.pth"
+    },
+    {
+      "id": "ranked_1723",
+      "name": "Ranked",
+      "display_label": "BT 1723",
+      "rating_system": "bt_rating",
+      "rating": 1723.47,
+      "conservative_rating": 1702.29,
+      "elo": 1751.28,
+      "weights_path": "assets/bots/ranked_1723.json",
+      "source_label": "league_stable_seeded_checkpoint_1000000.pth"
+    },
+    {
+      "id": "elite_1772",
+      "name": "Elite",
+      "display_label": "BT 1772",
+      "rating_system": "bt_rating",
+      "rating": 1772.38,
+      "conservative_rating": 1750.54,
+      "elo": 2050.62,
+      "weights_path": "assets/bots/elite_1772.json",
+      "source_label": "league_stable_seeded_checkpoint_8000000.pth"
+    },
+    {
+      "id": "master_1836",
+      "name": "Master",
+      "display_label": "BT 1836",
+      "rating_system": "bt_rating",
+      "rating": 1835.95,
+      "conservative_rating": 1812.82,
+      "elo": 2069.74,
+      "weights_path": "assets/bots/master_1836.json",
+      "source_label": "league_stable_seeded_checkpoint_11000000.pth"
+    },
+    {
+      "id": "champion_1953",
+      "name": "Champion",
+      "display_label": "BT 1953",
+      "rating_system": "bt_rating",
+      "rating": 1952.81,
+      "conservative_rating": 1925.68,
+      "elo": 2263.43,
+      "weights_path": "assets/bots/champion_1953.json",
+      "source_label": "league_stable_seeded_checkpoint_29000000.pth"
+    }
+  ]
+}

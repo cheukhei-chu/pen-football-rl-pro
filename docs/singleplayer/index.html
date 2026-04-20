@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pen Football - Choose An AI Bot</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg-a: #11335b;
+            --bg-b: #1a6ca8;
+            --card: rgba(255, 255, 255, 0.14);
+            --card-border: rgba(255, 255, 255, 0.18);
+            --text: #f6fbff;
+            --muted: rgba(246, 251, 255, 0.78);
+            --accent: #ffd166;
+            --button-a: #ff7b54;
+            --button-b: #ff416c;
+        }
+
+        body {
+            background: linear-gradient(140deg, var(--bg-a), var(--bg-b));
+            color: var(--text);
+            font-family: Arial, sans-serif;
+            min-height: 100vh;
+            padding: 32px 18px 48px;
+        }
+
+        .wrap {
+            margin: 0 auto;
+            max-width: 1080px;
+        }
+
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+
+        .back-link {
+            color: var(--text);
+            text-decoration: none;
+            border: 1px solid rgba(255, 255, 255, 0.22);
+            border-radius: 999px;
+            padding: 10px 16px;
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        h1 {
+            font-size: clamp(2rem, 5vw, 3.4rem);
+            line-height: 1.05;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: var(--muted);
+            font-size: 1.05rem;
+            margin-bottom: 26px;
+            max-width: 720px;
+        }
+
+        .bot-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 18px;
+        }
+
+        .bot-card {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: 22px;
+            padding: 22px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.14);
+        }
+
+        .bot-card h2 {
+            font-size: 1.5rem;
+            margin-bottom: 8px;
+        }
+
+        .rating {
+            color: var(--accent);
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .bot-card p {
+            color: var(--muted);
+            line-height: 1.45;
+            margin-bottom: 18px;
+            min-height: 66px;
+        }
+
+        .play-button {
+            display: inline-block;
+            background: linear-gradient(135deg, var(--button-a), var(--button-b));
+            color: white;
+            text-decoration: none;
+            padding: 12px 20px;
+            border-radius: 999px;
+            font-weight: bold;
+            letter-spacing: 0.02em;
+        }
+
+        .status {
+            color: var(--muted);
+            font-size: 1rem;
+            padding: 22px;
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 18px;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+        }
+
+        @media (max-width: 640px) {
+            .topbar {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="topbar">
+            <a class="back-link" href="../index.html">Back To Modes</a>
+        </div>
+
+        <h1>Choose Your AI Opponent</h1>
+        <p class="subtitle">
+            Pick a browser-exported checkpoint and jump straight into the match. Ratings below use the anchored Bradley-Terry numbers from the evaluation pipeline.
+        </p>
+
+        <div id="status" class="status">Loading available bots...</div>
+        <div id="bot-grid" class="bot-grid" hidden></div>
+    </div>
+
+    <script>
+        const descriptions = [
+            "A gentler opponent that still understands the ball and goal geometry.",
+            "Solid positioning and fewer obvious mistakes, but still beatable once you settle in.",
+            "Starts punishing weak touches and awkward landings more consistently.",
+            "Feels more assertive around loose balls and finishes stronger in open space.",
+            "A tougher checkpoint with sharper timing and cleaner pressure.",
+            "One of the strongest exported browser bots in the current pool."
+        ];
+
+        async function loadBots() {
+            const status = document.getElementById("status");
+            const grid = document.getElementById("bot-grid");
+
+            try {
+                const response = await fetch("assets/bots_manifest.json");
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const manifest = await response.json();
+                const bots = [...manifest.bots].sort((a, b) => a.rating - b.rating);
+                grid.innerHTML = "";
+
+                bots.forEach((bot, index) => {
+                    const card = document.createElement("article");
+                    card.className = "bot-card";
+                    const description = descriptions[Math.min(index, descriptions.length - 1)];
+                    card.innerHTML = `
+                        <h2>${bot.name}</h2>
+                        <div class="rating">BT Rating ${bot.rating.toFixed(0)}</div>
+                        <p>${description}</p>
+                        <a class="play-button" href="build/web/index.html?bot=${encodeURIComponent(bot.id)}">Play This Bot</a>
+                    `;
+                    grid.appendChild(card);
+                });
+
+                status.hidden = true;
+                grid.hidden = false;
+            } catch (error) {
+                status.textContent = `Could not load the bot list: ${error.message}`;
+            }
+        }
+
+        loadBots();
+    </script>
+</body>
+</html>
