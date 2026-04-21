@@ -33,6 +33,102 @@ def load_or_create_policy(policy):
     loaded_policy, checkpoint = policy_from_checkpoint_path(policy)
     return loaded_policy, checkpoint.get("policy_kwargs", {})
 
+
+def compute_td_errors(rewards, values, dones, last_val, gamma=0.99):
+    td_errors = []
+    T = len(rewards)
+    for t in range(T):
+        next_value = last_val if t == T - 1 else values[t + 1]
+        next_non_terminal = 1.0 - float(dones[t])
+        delta = rewards[t] + gamma * next_value * next_non_terminal - values[t]
+        td_errors.append(abs(float(delta)))
+    return td_errors
+
+
+class StateArchive:
+    def __init__(self, capacity=5000, alpha=0.7, min_priority=0.05):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.min_priority = min_priority
+        self.entries = []
+        self.next_idx = 0
+
+    def __len__(self):
+        return len(self.entries)
+
+    def add(self, state, priority):
+        if self.capacity <= 0:
+            return
+        entry = {
+            "state": copy.deepcopy(state),
+            "priority": max(float(priority), self.min_priority),
+        }
+        if len(self.entries) < self.capacity:
+            self.entries.append(entry)
+        else:
+            self.entries[self.next_idx] = entry
+            self.next_idx = (self.next_idx + 1) % self.capacity
+
+    def sample(self):
+        if not self.entries:
+            return None
+        weights = [entry["priority"] ** self.alpha for entry in self.entries]
+        choice = random.choices(self.entries, weights=weights, k=1)[0]
+        return copy.deepcopy(choice["state"])
+
+
+def sync_promoted_checkpoint_to_eval(
+    checkpoint_path,
+    db_path,
+    target_games=0,
+    deterministic=False,
+    max_steps=600,
+    report_dir=None,
+    device="cpu",
+    run_tag=None,
+    seed=None,
+):
+    from eval_ratings import (
+        add_builtin_model,
+        add_checkpoint_model,
+        connect_db,
+        export_reports,
+        load_models,
+        run_scheduled_matches,
+        schedule_missing_pairs,
+    )
+
+    conn = connect_db(db_path)
+    for builtin in ("dummy", "atul"):
+        add_builtin_model(conn, builtin)
+    add_checkpoint_model(conn, checkpoint_path)
+
+    models = load_models(conn)
+    schedule = schedule_missing_pairs(
+        conn,
+        models,
+        target_games=target_games,
+        deterministic=deterministic,
+        max_steps=max_steps,
+    )
+
+    if schedule:
+        run_scheduled_matches(
+            conn,
+            schedule,
+            deterministic=deterministic,
+            max_steps=max_steps,
+            device_name=device,
+            run_tag=run_tag,
+            seed=seed,
+        )
+
+    if report_dir:
+        export_reports(conn, report_dir, deterministic, max_steps)
+    conn.close()
+
+    return len(schedule)
+
 ###############################################################
 # =======================  GAE  ============================= #
 ###############################################################
@@ -122,7 +218,8 @@ def ppo_loss(
 ###############################################################
 
 def rollout(env, policy_red, policy_blue, select_drill,
-            rollout_len=2048, gamma=0.99, lam=0.95):
+            rollout_len=2048, gamma=0.99, lam=0.95,
+            reset_sampler=None, capture_states=False):
 
     obs_list = []
     act_list = {"left": [], "right": [], "jump": []}
@@ -131,6 +228,10 @@ def rollout(env, policy_red, policy_blue, select_drill,
     done_list = []
     val_list = []
     episode_scores = []
+    sim_state_list = []
+    episode_step_list = []
+    archived_reset_episodes = 0
+    total_episodes = 0
 
     steps = 0
     obs = None
@@ -149,14 +250,21 @@ def rollout(env, policy_red, policy_blue, select_drill,
         if is_feudal:
             policy_red.reset_state()
 
-        obs, _ = env.reset()
+        reset_options = reset_sampler() if reset_sampler is not None else None
+        obs, _ = env.reset(options=reset_options)
+        total_episodes += 1
+        archived_reset_episodes += int(reset_options is not None)
 
         done = False
+        episode_step = 0
 
         while not done and steps < rollout_len:
 
             # observation for red
             obs_tensor = torch.tensor(obs["player_red"], dtype=torch.float32).unsqueeze(0)
+            if capture_states:
+                sim_state_list.append(env.game.get_sim_state())
+                episode_step_list.append(episode_step)
 
             if is_feudal:
                 policy_red._update_manager(obs_tensor)
@@ -215,6 +323,7 @@ def rollout(env, policy_red, policy_blue, select_drill,
 
             steps += 1
             obs = next_obs
+            episode_step += 1
 
             if done:
                 score = result_to_score(info.get("result"))
@@ -244,8 +353,14 @@ def rollout(env, policy_red, policy_blue, select_drill,
     result = {
         "obs": obs_list, "acts": act_list, "logp": logp_list,
         "rew": rew_list, "val": val_list, "done": done_list,
-        "last_val": w_last_val, "episode_scores": episode_scores
+        "last_val": w_last_val,
+        "episode_scores": episode_scores,
+        "archived_reset_episodes": archived_reset_episodes,
+        "total_episodes": total_episodes,
     }
+    if capture_states:
+        result["sim_states"] = sim_state_list
+        result["episode_steps"] = episode_step_list
 
     # NEW: Return Manager data if it exists
     if is_feudal:
@@ -731,6 +846,20 @@ def train_league_ppo_real(
     lr_end=3e-5,
     max_round_steps=600,
     save_rejected_checkpoints=False,
+    archive_reset_prob=0.30,
+    archive_capacity=5000,
+    archive_alpha=0.7,
+    archive_min_priority=0.05,
+    archive_warmup=500,
+    archive_min_step=15,
+    archive_stride=4,
+    elo_sync_db=None,
+    elo_target_games=0,
+    elo_deterministic=False,
+    elo_max_steps=600,
+    elo_report_dir=None,
+    elo_device="cpu",
+    elo_seed=None,
 ):
     env = FootballMultiAgentEnv()
 
@@ -768,6 +897,13 @@ def train_league_ppo_real(
     recent_promotions = deque(maxlen=recent_window)
     if champion_path is not None:
         recent_promotions.append(champion_path)
+    state_archive = None
+    if archive_reset_prob > 0.0 and archive_capacity > 0:
+        state_archive = StateArchive(
+            capacity=archive_capacity,
+            alpha=archive_alpha,
+            min_priority=archive_min_priority,
+        )
 
     def mean_score_against(identifier):
         history = win_history.get(identifier)
@@ -795,6 +931,22 @@ def train_league_ppo_real(
                 recent_promotions.remove(removable)
             policy_cache.pop(removable, None)
             win_history.pop(removable, None)
+
+    def sample_training_reset():
+        if state_archive is None or len(state_archive) < archive_warmup:
+            return None
+        if random.random() >= archive_reset_prob:
+            return None
+
+        sampled_state = state_archive.sample()
+        if sampled_state is None:
+            return None
+
+        return {
+            "state": sampled_state,
+            "reset_score": True,
+            "reset_time_steps": True,
+        }
 
     def select_opponent_identifier():
         categories = []
@@ -925,7 +1077,10 @@ def train_league_ppo_real(
             policy_blue,
             select_drill=lambda: None,
             rollout_len=rollout_len,
-            gamma=gamma, lam=lam
+            gamma=gamma,
+            lam=lam,
+            reset_sampler=sample_training_reset,
+            capture_states=state_archive is not None,
         )
 
         obs      = roll["obs"]
@@ -938,6 +1093,19 @@ def train_league_ppo_real(
         episode_scores = roll.get("episode_scores", [])
 
         record_episode_scores(opponent_id, episode_scores)
+
+        if state_archive is not None and "sim_states" in roll:
+            td_errors = compute_td_errors(rewards, values, dones, last_val, gamma)
+            for sim_state, td_error, episode_step in zip(
+                roll["sim_states"],
+                td_errors,
+                roll["episode_steps"],
+            ):
+                if episode_step < archive_min_step:
+                    continue
+                if archive_stride > 1 and (episode_step % archive_stride != 0):
+                    continue
+                state_archive.add(sim_state, td_error)
 
         steps += rollout_len
 
@@ -988,6 +1156,9 @@ def train_league_ppo_real(
                 f"[{steps - (steps % print_every)}] "
                 f"mean reward = {sum(rewards_save)/len(rewards_save):.3f} | "
                 f"mean episode score = {np.mean(score_save) if score_save else 0.5:.3f} | "
+                f"archive size = {len(state_archive) if state_archive is not None else 0} | "
+                f"archived reset rate = "
+                f"{(roll.get('archived_reset_episodes', 0) / max(roll.get('total_episodes', 1), 1)):.2f} | "
                 f"lr = {curr_lr:.6f} | ent = {curr_ent_coef:.4f} | "
                 f"approx_kl = {mean_metrics.get('approx_kl', 0.0):.4f} | "
                 f"clipfrac = {mean_metrics.get('clip_fraction', 0.0):.3f}"
@@ -1009,12 +1180,30 @@ def train_league_ppo_real(
                 recent_promotions.append(save_path)
                 trim_historical_pool()
 
+                eval_schedule_len = None
+                if elo_sync_db is not None:
+                    eval_schedule_len = sync_promoted_checkpoint_to_eval(
+                        save_path,
+                        db_path=elo_sync_db,
+                        target_games=elo_target_games,
+                        deterministic=elo_deterministic,
+                        max_steps=elo_max_steps,
+                        report_dir=elo_report_dir,
+                        device=elo_device,
+                        run_tag=f"promotion_{checkpoint_step}",
+                        seed=elo_seed,
+                    )
+
                 print(
                     f"Promoted checkpoint at step {checkpoint_step} | "
                     f"overall = {summary['overall_score']:.3f} | "
                     f"champion = {summary['champion_score'] if summary['champion_score'] is not None else float('nan'):.3f} | "
                     f"benchmarks = {summary['benchmark_scores']} | "
                     f"historical = {summary['historical_score'] if summary['historical_score'] is not None else float('nan'):.3f}"
+                    + (
+                        f" | elo scheduled matches = {eval_schedule_len}"
+                        if eval_schedule_len is not None else ""
+                    )
                 )
             else:
                 if save_rejected_checkpoints:
@@ -1067,6 +1256,20 @@ if __name__ == "__main__":
     stable_parser.add_argument("--fixed-benchmarks", nargs="*", default=["dummy", "atul"])
     stable_parser.add_argument("--seed-pool", nargs="*", default=[], help="Optional list of checkpoint paths to seed the historical pool.")
     stable_parser.add_argument("--save-rejected-checkpoints", action="store_true")
+    stable_parser.add_argument("--archive-reset-prob", type=float, default=0.30)
+    stable_parser.add_argument("--archive-capacity", type=int, default=5000)
+    stable_parser.add_argument("--archive-alpha", type=float, default=0.7)
+    stable_parser.add_argument("--archive-min-priority", type=float, default=0.05)
+    stable_parser.add_argument("--archive-warmup", type=int, default=500)
+    stable_parser.add_argument("--archive-min-step", type=int, default=15)
+    stable_parser.add_argument("--archive-stride", type=int, default=4)
+    stable_parser.add_argument("--elo-sync-db", default=None, help="Optional eval DB to update automatically on promotion.")
+    stable_parser.add_argument("--elo-target-games", type=int, default=0, help="If > 0, also run missing eval games up to this per pair.")
+    stable_parser.add_argument("--elo-deterministic", action="store_true", help="Use deterministic actions for automatic eval sync.")
+    stable_parser.add_argument("--elo-max-steps", type=int, default=600)
+    stable_parser.add_argument("--elo-report-dir", default=None, help="Optional eval report dir to refresh after promotion sync.")
+    stable_parser.add_argument("--elo-device", default="cpu")
+    stable_parser.add_argument("--elo-seed", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -1099,4 +1302,18 @@ if __name__ == "__main__":
             fixed_benchmarks=tuple(args.fixed_benchmarks),
             opponent_pool=args.seed_pool,
             save_rejected_checkpoints=args.save_rejected_checkpoints,
+            archive_reset_prob=args.archive_reset_prob,
+            archive_capacity=args.archive_capacity,
+            archive_alpha=args.archive_alpha,
+            archive_min_priority=args.archive_min_priority,
+            archive_warmup=args.archive_warmup,
+            archive_min_step=args.archive_min_step,
+            archive_stride=args.archive_stride,
+            elo_sync_db=args.elo_sync_db,
+            elo_target_games=args.elo_target_games,
+            elo_deterministic=args.elo_deterministic,
+            elo_max_steps=args.elo_max_steps,
+            elo_report_dir=args.elo_report_dir,
+            elo_device=args.elo_device,
+            elo_seed=args.elo_seed,
         )

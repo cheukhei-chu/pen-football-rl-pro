@@ -66,6 +66,32 @@ class FootballGame:
         self.to_draw = []
         return self._get_internal_observation()
 
+    def get_sim_state(self):
+        """Returns a full simulator snapshot that can be restored later."""
+        return {
+            'red': dict(self.red),
+            'blue': dict(self.blue),
+            'ball': dict(self.ball),
+            'score_red': int(getattr(self, 'score_red', 0)),
+            'score_blue': int(getattr(self, 'score_blue', 0)),
+            'time_steps': int(getattr(self, 'time_steps', 0)),
+        }
+
+    def set_sim_state(self, state, reset_score=True, reset_time_steps=True):
+        """Restores a previously captured simulator snapshot."""
+        self.red = dict(state['red'])
+        self.blue = dict(state['blue'])
+        self.ball = dict(state['ball'])
+        if reset_score:
+            self.score_red = 0
+            self.score_blue = 0
+        else:
+            self.score_red = int(state.get('score_red', 0))
+            self.score_blue = int(state.get('score_blue', 0))
+        self.time_steps = 0 if reset_time_steps else int(state.get('time_steps', 0))
+        self.to_draw = []
+        return self._get_internal_observation()
+
     def preset(self, obs, reset_score=True):
         """Resets the entire game to the give state for a new episode."""
         self.red = {'x': obs[0]*WALL_X, 'y': obs[1]*CEILING_Y, 'vx': obs[2]*20, 'vy': obs[3]*20, 'can_double_jump': False, 'is_waiting_for_jump_key_release': False}

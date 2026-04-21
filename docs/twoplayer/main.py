@@ -51,14 +51,24 @@ class FootballGame:
         self.red = {'x': -200, 'y': -130, 'vx': 0, 'vy': 0, 'can_double_jump': False, 'is_waiting_for_jump_key_release': False}
         self.blue = {'x': 200, 'y': -130, 'vx': 0, 'vy': 0, 'can_double_jump': False, 'is_waiting_for_jump_key_release': False}
 
-    def reset(self):
+    def _get_internal_observation(self):
+        return [
+            self.red['x']/WALL_X, self.red['y']/CEILING_Y, self.red['vx']/20, self.red['vy']/20,
+            self.blue['x']/WALL_X, self.blue['y']/CEILING_Y, self.blue['vx']/20, self.blue['vy']/20,
+            self.ball['x']/WALL_X, self.ball['y']/CEILING_Y, self.ball['vx']/20, self.ball['vy']/20,
+        ]
+
+    def reset(self, reset_score=True):
         """Resets the entire game to its initial state for a new episode."""
         self._reset_round()
-        self.score_red = 0
-        self.score_blue = 0
+        if reset_score:
+            self.score_red = 0
+            self.score_blue = 0
         self.time_steps = 0
+        return self._get_internal_observation()
 
     def _update_player(self, player, keys):
+        jump_failed = False
         is_on_ground = player['y'] <= GROUND_Y
 
         if player['is_waiting_for_jump_key_release'] and not keys['jump']:
@@ -72,6 +82,8 @@ class FootballGame:
             elif player['can_double_jump'] and player['vy'] < 5:
                 player['vy'] = 12
                 player['can_double_jump'] = False
+            else:
+                jump_failed = True
 
         if keys['right']: player['vx'] += 1
         if keys['left']: player['vx'] -= 1
@@ -89,17 +101,35 @@ class FootballGame:
             player['can_double_jump'] = False
             player['is_waiting_for_jump_key_release'] = False
 
+        move_towards_ball = (
+            (not keys['left'] and keys['right'] and self.ball['x'] > player['x'])
+            or (keys['left'] and not keys['right'] and self.ball['x'] < player['x'])
+        )
+        return jump_failed, move_towards_ball
+
     def _update_ball(self):
+        red_kicked = False
+        blue_kicked = False
+        ball_hit_ground = False
+        ball_hit_ceiling = False
+        ball_hit_left_wall = False
+        ball_hit_right_wall = False
+
         def process_collision(player):
             dx = self.ball['x'] - player['x']
             self.ball['vx'] = (player['vx'] * abs(dx)) / 5 + dx / 5
             self.ball['vy'] = player['vy'] + 10
 
         # Using math.hypot instead of np.hypot
-        if math.hypot(self.ball['x'] - self.red['x'], self.ball['y'] - self.red['y']) < 20:
+        red_ball_dist = math.hypot(self.ball['x'] - self.red['x'], self.ball['y'] - self.red['y'])
+        blue_ball_dist = math.hypot(self.ball['x'] - self.blue['x'], self.ball['y'] - self.blue['y'])
+
+        if red_ball_dist < 20:
             process_collision(self.red)
-        if math.hypot(self.ball['x'] - self.blue['x'], self.ball['y'] - self.blue['y']) < 20:
+            red_kicked = True
+        if blue_ball_dist < 20:
             process_collision(self.blue)
+            blue_kicked = True
 
         self.ball['vy'] -= 1
         self.ball['vx'] *= 0.97
@@ -107,17 +137,65 @@ class FootballGame:
         self.ball['y'] += self.ball['vy']
 
         # Using math.copysign instead of np.sign
-        if abs(self.ball['x']) > WALL_X:
+        if self.ball['x'] > WALL_X:
             self.ball['x'] = math.copysign(WALL_X, self.ball['x'])
             self.ball['vx'] = self.ball['vx'] * -0.7
+            ball_hit_right_wall = True
+        if self.ball['x'] < -WALL_X:
+            self.ball['x'] = math.copysign(WALL_X, self.ball['x'])
+            self.ball['vx'] = self.ball['vx'] * -0.7
+            ball_hit_left_wall = True
         if self.ball['y'] < GROUND_Y:
+            ball_hit_ground = True
             self.ball['y'], self.ball['vy'] = GROUND_Y, self.ball['vy'] * -0.7
         if self.ball['y'] > CEILING_Y:
+            ball_hit_ceiling = True
             self.ball['y'], self.ball['vy'] = CEILING_Y, self.ball['vy'] * -0.7
 
         if abs(self.ball['x']) > 205 and self.ball['y'] > -40 and self.ball['y'] + self.ball['vy'] <= -40:
             self.ball['y'], self.ball['vy'] = -40, 5
             self.ball['vx'] = -5 * math.copysign(1, self.ball['x'])
+
+        return (
+            (red_ball_dist, red_kicked),
+            (blue_ball_dist, blue_kicked),
+            (ball_hit_ground, ball_hit_ceiling, ball_hit_left_wall, ball_hit_right_wall),
+        )
+
+    def step(self, red_keys, blue_keys):
+        red_state, blue_state, game_state = {}, {}, {}
+        red_state['jump_failed'], red_state['move_towards_ball'] = self._update_player(self.red, red_keys)
+        blue_state['jump_failed'], blue_state['move_towards_ball'] = self._update_player(self.blue, blue_keys)
+        (
+            (red_state['ball_dist'], red_state['kicked']),
+            (blue_state['ball_dist'], blue_state['kicked']),
+            (ball_hit_ground, ball_hit_ceiling, ball_hit_left_wall, ball_hit_right_wall),
+        ) = self._update_ball()
+        red_state['scored'], blue_state['scored'] = False, False
+        red_state['x'], red_state['y'] = self.red['x']/WALL_X, self.red['y']/CEILING_Y
+        game_state['ball_x'], game_state['ball_y'] = self.ball['x']/WALL_X, self.ball['y']/CEILING_Y
+
+        if self.ball['y'] < -40:
+            if self.ball['x'] > 210:
+                self.score_red += 1
+                red_state['scored'] = True
+                self._reset_round()
+            elif self.ball['x'] < -210:
+                self.score_blue += 1
+                blue_state['scored'] = True
+                self._reset_round()
+
+        terminated = (self.score_red >= 10 or self.score_blue >= 10)
+
+        self.time_steps += 1
+        truncated = self.time_steps >= 1800
+        game_state['time_steps'] = self.time_steps
+        game_state['ball_hit_ground'] = ball_hit_ground
+        game_state['ball_hit_ceiling'] = ball_hit_ceiling
+        game_state['ball_hit_left_wall'] = ball_hit_left_wall
+        game_state['ball_hit_right_wall'] = ball_hit_right_wall
+
+        return self._get_internal_observation(), (red_state, blue_state, game_state), terminated, truncated, {}
 
     def render(self):
         if self.render_mode != 'human':
@@ -205,19 +283,9 @@ async def main():
         red_keys = {'jump': keys[pygame.K_w], 'left': keys[pygame.K_a], 'right': keys[pygame.K_d]}
         blue_keys = {'jump': keys[pygame.K_UP], 'left': keys[pygame.K_LEFT], 'right': keys[pygame.K_RIGHT]}
 
-        game._update_player(game.red, red_keys)
-        game._update_player(game.blue, blue_keys)
-        game._update_ball()
+        _, _, terminated, truncated, _ = game.step(red_keys, blue_keys)
 
-        if game.ball['y'] < -50:
-            if game.ball['x'] > 210:
-                game.score_red += 1
-                game._reset_round()
-            elif game.ball['x'] < -210:
-                game.score_blue += 1
-                game._reset_round()
-
-        if game.score_red >= 10 or game.score_blue >= 10:
+        if terminated or truncated:
             print(f"Game Over! Final Score: Red {game.score_red} - Blue {game.score_blue}")
             game.reset()
 

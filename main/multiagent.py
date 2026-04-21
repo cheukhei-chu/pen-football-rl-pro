@@ -70,7 +70,13 @@ class FootballMultiAgentEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None, reset_score=True):
         self.history = {}
-        if self.setting is None:
+        if options and options.get("state") is not None:
+            self.game.set_sim_state(
+                options["state"],
+                reset_score=options.get("reset_score", reset_score),
+                reset_time_steps=options.get("reset_time_steps", True),
+            )
+        elif self.setting is None:
             self.game.reset(reset_score=reset_score)
         elif self.setting["drill"] == "block":
             data = np.load("../samples/block.npy")
