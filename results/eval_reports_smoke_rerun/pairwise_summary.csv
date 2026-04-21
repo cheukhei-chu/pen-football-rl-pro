@@ -1,0 +1,2 @@
+model_a,model_b,games,mean_score_a,ci_low_a,ci_high_a
+builtin:dummy,builtin:atul,2,0.0000,0.0000,0.6576

@@ -1,0 +1,4 @@
+model_key,label,is_anchor,games,bt_rating,raw_bt_rating,bt_std_err,bt_conservative_rating,raw_bt_conservative_rating,elo,raw_elo,glicko_rating,raw_glicko_rating,glicko_rd,conservative_rating,raw_conservative_rating,bt_anchor_shift,elo_anchor_shift,glicko_anchor_shift
+builtin:atul,builtin:atul,1,0,1500.00,1500.00,350.0000,800.00,800.00,1500.00,1500.00,1500.00,1500.00,350.00,800.00,800.00,0.00,0.00,0.00
+builtin:dummy,builtin:dummy,0,0,1500.00,1500.00,350.0000,800.00,800.00,1500.00,1500.00,1500.00,1500.00,350.00,800.00,800.00,0.00,0.00,0.00
+/Users/cheukheichu/Desktop/MIT/Junior Spring/Others/pen-football-rl/checkpoints/smoke_elo_sync/checkpoint_128.pth,smoke_elo_sync_checkpoint_128.pth,0,0,1500.00,1500.00,350.0000,800.00,800.00,1500.00,1500.00,1500.00,1500.00,350.00,800.00,800.00,0.00,0.00,0.00

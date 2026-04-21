@@ -1,0 +1,27 @@
+Ratings are anchored so the mean rating of the anchor set is 1500.00.
+Bradley-Terry anchor shift applied: 182.617652
+Elo anchor shift applied: 304.293834
+Glicko anchor shift applied: 184.566320
+Anchor count: 21
+Anchor models:
+- builtin:atul
+- elo_tournament_baseline_league_ppo (misc rewards)_checkpoint_1100000.pth
+- elo_tournament_baseline_league_ppo (misc rewards)_checkpoint_7100000.pth
+- elo_tournament_baseline_league_ppo (misc rewards)_checkpoint_8300000.pth
+- elo_tournament_baseline_league_ppo (score reward)_checkpoint_12500000.pth
+- elo_tournament_baseline_league_ppo (score reward)_checkpoint_22000000.pth
+- elo_tournament_baseline_league_ppo (score reward)_checkpoint_3800000.pth
+- elo_tournament_baseline_league_ppo_real (score reward) checkpoint_2100000.pth
+- elo_tournament_baseline_league_ppo_real (score reward)_checkpoint_12500000.pth
+- elo_tournament_baseline_league_ppo_regular (score reward)_checkpoint_1000000.pth
+- elo_tournament_baseline_league_ppo_regular (score reward)_checkpoint_10100000.pth
+- elo_tournament_baseline_league_ppo_regular (score reward)_checkpoint_4200000.pth
+- elo_tournament_test_league_ppo_misc_checkpoint_4500000.pth
+- elo_tournament_test_league_ppo_misc_checkpoint_8300000.pth
+- elo_tournament_test_league_ppo_real_checkpoint_13700000.pth
+- elo_tournament_test_league_ppo_real_checkpoint_7300000.pth
+- elo_tournament_test_league_ppo_regular_checkpoint_15300000.pth
+- elo_tournament_test_league_ppo_regular_checkpoint_7500000.pth
+- elo_tournament_test_league_ppo_score_checkpoint_10000000.pth
+- elo_tournament_test_league_ppo_score_checkpoint_20000000.pth
+- elo_tournament_test_league_ppo_score_checkpoint_30000000.pth

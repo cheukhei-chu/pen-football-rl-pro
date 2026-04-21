@@ -1,0 +1,4 @@
+model,builtin:atul,builtin:dummy,smoke_elo_sync_checkpoint_128.pth
+builtin:atul,0,0,0
+builtin:dummy,0,0,0
+smoke_elo_sync_checkpoint_128.pth,0,0,0
