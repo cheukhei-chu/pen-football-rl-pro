@@ -1,0 +1,90 @@
+command: league-stable
+
+name: league_stable_generalist_run5
+policy_checkpoint: checkpoints/league_stable_generalist_run4/checkpoint_119000000.pth
+
+total_steps: 25000000
+rollout_len: 2048
+lr: 0.00005
+lr_end: 0.000005
+epochs: 10
+batch_size: 256
+pool_size: 200
+print_every: 10000
+save_every: 1000000
+
+promotion_games: 80
+benchmark_games: 40
+historical_eval_opponents: 12
+historical_eval_games: 12
+promotion_threshold: 0.55
+benchmark_threshold: 0.55
+historical_threshold: 0.52
+target_kl: 0.02
+max_grad_norm: 0.5
+vf_clip_ratio: 0.2
+ent_coef_start: 0.01
+ent_coef_end: 0.001
+
+fixed_benchmarks:
+  - dummy
+  - atul
+
+archive_reset_prob: 0.0
+archive_capacity: 5000
+archive_alpha: 0.7
+archive_min_priority: 0.05
+archive_warmup: 500
+archive_min_step: 15
+archive_stride: 4
+
+elo_sync_db: results/eval_ratings_stochastic.sqlite
+elo_target_games: 40
+elo_max_steps: 600
+elo_report_dir: results/eval_reports/stochastic
+elo_device: cpu
+elo_num_workers: 2
+
+num_workers: 3
+
+seed_pool:
+  - checkpoints/league_stable_seeded/checkpoint_1000000.pth
+  - checkpoints/league_stable_seeded/checkpoint_5000000.pth
+  - checkpoints/league_stable_seeded/checkpoint_6000000.pth
+  - checkpoints/league_stable_seeded/checkpoint_8000000.pth
+  - checkpoints/league_stable_seeded/checkpoint_11000000.pth
+  - checkpoints/league_stable_seeded/checkpoint_29000000.pth
+  - checkpoints/league_stable_curated_run1/checkpoint_35000000.pth
+  - checkpoints/league_stable_curated_run1/checkpoint_47000000.pth
+  - checkpoints/league_stable_curated_run1/checkpoint_54000000.pth
+  - checkpoints/league_stable_curated_run1/checkpoint_56000000.pth
+  - checkpoints/league_stable_generalist_run1/checkpoint_20000000.pth
+  - checkpoints/league_stable_generalist_run1/checkpoint_22000000.pth
+  - checkpoints/league_stable_generalist_run1/checkpoint_26000000.pth
+  - checkpoints/league_stable_generalist_run1/checkpoint_28000000.pth
+  - checkpoints/league_stable_generalist_run2/checkpoint_35000000.pth
+  - checkpoints/league_stable_generalist_run2/checkpoint_43000000.pth
+  - checkpoints/league_stable_generalist_run2/checkpoint_57000000.pth
+  - checkpoints/league_stable_generalist_run2/checkpoint_65000000.pth
+  - checkpoints/league_stable_generalist_run2/checkpoint_68000000.pth
+  - checkpoints/league_stable_generalist_run2/checkpoint_74000000.pth
+  - checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_13000000.pth
+  - checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_35000000.pth
+  - checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_53000000.pth
+  - checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_59000000.pth
+  - checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_72000000.pth
+  - checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_74000000.pth
+  - checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_79000000.pth
+  - checkpoints/league_stable_generalist_run4/checkpoint_20000000.pth
+  - checkpoints/league_stable_generalist_run4/checkpoint_53000000.pth
+  - checkpoints/league_stable_generalist_run4/checkpoint_67000000.pth
+  - checkpoints/league_stable_generalist_run4/checkpoint_83000000.pth
+  - checkpoints/league_stable_generalist_run4/checkpoint_105000000.pth
+  - checkpoints/league_stable_generalist_run4/checkpoint_115000000.pth
+  - checkpoints/elo_tournament_baseline/league_ppo (misc rewards)_checkpoint_7100000.pth
+  - checkpoints/elo_tournament_baseline/league_ppo (misc rewards)_checkpoint_8300000.pth
+  - checkpoints/elo_tournament_baseline/league_ppo (score reward)_checkpoint_12500000.pth
+  - checkpoints/elo_tournament_baseline/league_ppo (score reward)_checkpoint_22000000.pth
+  - checkpoints/elo_tournament_test/league_ppo_score_checkpoint_10000000.pth
+  - checkpoints/elo_tournament_test/league_ppo_score_checkpoint_20000000.pth
+  - checkpoints/elo_tournament_test/league_ppo_score_checkpoint_30000000.pth

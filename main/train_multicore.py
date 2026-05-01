@@ -1,14 +1,17 @@
 import argparse
 import copy
+import json
 import multiprocessing as mp
 import os
 import random
+import sys
 import traceback
 from collections import defaultdict, deque
 
 import numpy as np
 import torch
 import torch.optim as optim
+import yaml
 
 from policy import DummyPolicy, atulPolicy, make_policy, policy_from_checkpoint_path
 from train import (
@@ -444,6 +447,161 @@ def build_archive_snapshot(state_archive, archive_warmup):
     if state_archive is None or len(state_archive) < archive_warmup:
         return None
     return copy.deepcopy(state_archive.entries)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Train Pen Football agents with multicore rollout collection.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    stable_parser = subparsers.add_parser("league-stable", help="Run the stabilized league PPO trainer with multicore rollouts.")
+    stable_parser.add_argument("--config", help="Optional YAML config file for this training run.")
+    stable_parser.add_argument("--name", required=True, help="Checkpoint folder name to create under ../checkpoints.")
+    policy_group = stable_parser.add_mutually_exclusive_group(required=True)
+    policy_group.add_argument("--policy-checkpoint", help="Warm-start from an existing checkpoint.")
+    policy_group.add_argument("--policy-class", help="Create a fresh policy by class name, e.g. ActorCriticMLPPolicy.")
+    stable_parser.add_argument("--policy-kwargs", default="{}", help="JSON object of kwargs for --policy-class.")
+    stable_parser.add_argument("--total-steps", type=int, default=30_000_000)
+    stable_parser.add_argument("--rollout-len", type=int, default=2048)
+    stable_parser.add_argument("--lr", type=float, default=3e-4)
+    stable_parser.add_argument("--lr-end", type=float, default=3e-5)
+    stable_parser.add_argument("--epochs", type=int, default=10)
+    stable_parser.add_argument("--batch-size", type=int, default=256)
+    stable_parser.add_argument("--pool-size", type=int, default=200)
+    stable_parser.add_argument("--print-every", type=int, default=10_000)
+    stable_parser.add_argument("--save-every", type=int, default=1_000_000)
+    stable_parser.add_argument("--promotion-games", type=int, default=40)
+    stable_parser.add_argument("--benchmark-games", type=int, default=20)
+    stable_parser.add_argument("--historical-eval-opponents", type=int, default=4)
+    stable_parser.add_argument("--historical-eval-games", type=int, default=10)
+    stable_parser.add_argument("--promotion-threshold", type=float, default=0.55)
+    stable_parser.add_argument("--benchmark-threshold", type=float, default=0.50)
+    stable_parser.add_argument("--historical-threshold", type=float, default=0.50)
+    stable_parser.add_argument("--target-kl", type=float, default=0.02)
+    stable_parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    stable_parser.add_argument("--vf-clip-ratio", type=float, default=0.2)
+    stable_parser.add_argument("--ent-coef-start", type=float, default=0.01)
+    stable_parser.add_argument("--ent-coef-end", type=float, default=0.001)
+    stable_parser.add_argument("--fixed-benchmarks", nargs="*", default=["dummy", "atul"])
+    stable_parser.add_argument("--seed-pool", nargs="*", default=[], help="Optional list of checkpoint paths to seed the historical pool.")
+    stable_parser.add_argument("--save-rejected-checkpoints", action="store_true")
+    stable_parser.add_argument("--archive-reset-prob", type=float, default=0.30)
+    stable_parser.add_argument("--archive-capacity", type=int, default=5000)
+    stable_parser.add_argument("--archive-alpha", type=float, default=0.7)
+    stable_parser.add_argument("--archive-min-priority", type=float, default=0.05)
+    stable_parser.add_argument("--archive-warmup", type=int, default=500)
+    stable_parser.add_argument("--archive-min-step", type=int, default=15)
+    stable_parser.add_argument("--archive-stride", type=int, default=4)
+    stable_parser.add_argument("--elo-sync-db", default=None, help="Optional eval DB to update automatically on promotion.")
+    stable_parser.add_argument("--elo-target-games", type=int, default=0, help="If > 0, also run missing eval games up to this per pair.")
+    stable_parser.add_argument("--elo-deterministic", action="store_true", help="Use deterministic actions for automatic eval sync.")
+    stable_parser.add_argument("--elo-max-steps", type=int, default=600)
+    stable_parser.add_argument("--elo-report-dir", default=None, help="Optional eval report dir to refresh after promotion sync.")
+    stable_parser.add_argument("--elo-device", default="cpu")
+    stable_parser.add_argument("--elo-seed", type=int, default=None)
+    stable_parser.add_argument("--elo-num-workers", type=int, default=1, help="Number of parallel workers to use for training-time Elo sync.")
+    stable_parser.add_argument("--num-workers", type=int, default=2, help="Number of rollout worker processes to use.")
+
+    return parser
+
+
+def extract_config_path(argv):
+    for idx, token in enumerate(argv):
+        if token == "--config":
+            if idx + 1 >= len(argv):
+                raise ValueError("--config requires a path.")
+            return argv[idx + 1]
+        if token.startswith("--config="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def find_command_token(argv):
+    idx = 0
+    while idx < len(argv):
+        token = argv[idx]
+        if token == "--config":
+            idx += 2
+            continue
+        if token.startswith("--config="):
+            idx += 1
+            continue
+        if not token.startswith("-"):
+            return token
+        idx += 1
+    return None
+
+
+def load_yaml_config(config_path):
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Config file must contain a top-level mapping: {config_path}")
+    return config
+
+
+def get_subparser_for_command(parser, command_name):
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            if command_name in action.choices:
+                return action.choices[command_name]
+    return None
+
+
+def option_explicitly_set(argv, action):
+    for opt in action.option_strings:
+        if opt in argv:
+            return True
+        if opt.startswith("--") and any(token.startswith(opt + "=") for token in argv):
+            return True
+    return False
+
+
+def maybe_json_encode_policy_kwargs(config):
+    if "policy_kwargs" in config and isinstance(config["policy_kwargs"], dict):
+        config = dict(config)
+        config["policy_kwargs"] = json.dumps(config["policy_kwargs"])
+    return config
+
+
+def apply_config_defaults(parser, argv):
+    config_path = extract_config_path(argv)
+    if config_path is None:
+        return argv
+
+    config = maybe_json_encode_policy_kwargs(load_yaml_config(config_path))
+    argv_command = find_command_token(argv)
+    subparser = get_subparser_for_command(parser, argv_command) if argv_command is not None else None
+    command_name = argv_command if subparser is not None else config.get("command")
+    if command_name is None:
+        raise ValueError("No training command provided. Pass a command such as 'league-stable' or set 'command' in the YAML config.")
+
+    if subparser is None:
+        argv = [command_name] + argv
+
+    subparser = get_subparser_for_command(parser, command_name)
+    if subparser is None:
+        raise ValueError(f"Unknown command in config: {command_name}")
+
+    for action in subparser._actions:
+        if not action.dest or action.dest == "help":
+            continue
+        if action.dest not in config:
+            continue
+        if option_explicitly_set(argv, action):
+            continue
+        parser.set_defaults(**{action.dest: config[action.dest]})
+        subparser.set_defaults(**{action.dest: config[action.dest]})
+        action.required = False
+
+    for group in subparser._mutually_exclusive_groups:
+        for action in group._group_actions:
+            if action.dest in config or option_explicitly_set(argv, action):
+                group.required = False
+                break
+
+    return argv
 
 
 def sync_promoted_checkpoint_to_eval_multicore(
@@ -885,57 +1043,9 @@ def train_league_ppo_real_multicore(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Pen Football agents with multicore rollout collection.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    stable_parser = subparsers.add_parser("league-stable", help="Run the stabilized league PPO trainer with multicore rollouts.")
-    stable_parser.add_argument("--name", required=True, help="Checkpoint folder name to create under ../checkpoints.")
-    policy_group = stable_parser.add_mutually_exclusive_group(required=True)
-    policy_group.add_argument("--policy-checkpoint", help="Warm-start from an existing checkpoint.")
-    policy_group.add_argument("--policy-class", help="Create a fresh policy by class name, e.g. ActorCriticMLPPolicy.")
-    stable_parser.add_argument("--policy-kwargs", default="{}", help="JSON object of kwargs for --policy-class.")
-    stable_parser.add_argument("--total-steps", type=int, default=30_000_000)
-    stable_parser.add_argument("--rollout-len", type=int, default=2048)
-    stable_parser.add_argument("--lr", type=float, default=3e-4)
-    stable_parser.add_argument("--lr-end", type=float, default=3e-5)
-    stable_parser.add_argument("--epochs", type=int, default=10)
-    stable_parser.add_argument("--batch-size", type=int, default=256)
-    stable_parser.add_argument("--pool-size", type=int, default=200)
-    stable_parser.add_argument("--print-every", type=int, default=10_000)
-    stable_parser.add_argument("--save-every", type=int, default=1_000_000)
-    stable_parser.add_argument("--promotion-games", type=int, default=40)
-    stable_parser.add_argument("--benchmark-games", type=int, default=20)
-    stable_parser.add_argument("--historical-eval-opponents", type=int, default=4)
-    stable_parser.add_argument("--historical-eval-games", type=int, default=10)
-    stable_parser.add_argument("--promotion-threshold", type=float, default=0.55)
-    stable_parser.add_argument("--benchmark-threshold", type=float, default=0.50)
-    stable_parser.add_argument("--historical-threshold", type=float, default=0.50)
-    stable_parser.add_argument("--target-kl", type=float, default=0.02)
-    stable_parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    stable_parser.add_argument("--vf-clip-ratio", type=float, default=0.2)
-    stable_parser.add_argument("--ent-coef-start", type=float, default=0.01)
-    stable_parser.add_argument("--ent-coef-end", type=float, default=0.001)
-    stable_parser.add_argument("--fixed-benchmarks", nargs="*", default=["dummy", "atul"])
-    stable_parser.add_argument("--seed-pool", nargs="*", default=[], help="Optional list of checkpoint paths to seed the historical pool.")
-    stable_parser.add_argument("--save-rejected-checkpoints", action="store_true")
-    stable_parser.add_argument("--archive-reset-prob", type=float, default=0.30)
-    stable_parser.add_argument("--archive-capacity", type=int, default=5000)
-    stable_parser.add_argument("--archive-alpha", type=float, default=0.7)
-    stable_parser.add_argument("--archive-min-priority", type=float, default=0.05)
-    stable_parser.add_argument("--archive-warmup", type=int, default=500)
-    stable_parser.add_argument("--archive-min-step", type=int, default=15)
-    stable_parser.add_argument("--archive-stride", type=int, default=4)
-    stable_parser.add_argument("--elo-sync-db", default=None, help="Optional eval DB to update automatically on promotion.")
-    stable_parser.add_argument("--elo-target-games", type=int, default=0, help="If > 0, also run missing eval games up to this per pair.")
-    stable_parser.add_argument("--elo-deterministic", action="store_true", help="Use deterministic actions for automatic eval sync.")
-    stable_parser.add_argument("--elo-max-steps", type=int, default=600)
-    stable_parser.add_argument("--elo-report-dir", default=None, help="Optional eval report dir to refresh after promotion sync.")
-    stable_parser.add_argument("--elo-device", default="cpu")
-    stable_parser.add_argument("--elo-seed", type=int, default=None)
-    stable_parser.add_argument("--elo-num-workers", type=int, default=1, help="Number of parallel workers to use for training-time Elo sync.")
-    stable_parser.add_argument("--num-workers", type=int, default=2, help="Number of rollout worker processes to use.")
-
-    args = parser.parse_args()
+    parser = build_parser()
+    argv = apply_config_defaults(parser, sys.argv[1:])
+    args = parser.parse_args(argv)
 
     if args.command == "league-stable":
         policy_spec = parse_policy_spec(args.policy_checkpoint, args.policy_class, args.policy_kwargs)

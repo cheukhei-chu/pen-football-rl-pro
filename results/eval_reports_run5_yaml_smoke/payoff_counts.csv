@@ -1,0 +1,4 @@
+model,builtin:atul,builtin:dummy,smoke_run5_config_checkpoint_256.pth
+builtin:atul,0,2,2
+builtin:dummy,2,0,2
+smoke_run5_config_checkpoint_256.pth,2,2,0

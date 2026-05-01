@@ -1,0 +1,4 @@
+model_key,label,is_anchor,games,bt_rating,raw_bt_rating,bt_std_err,bt_conservative_rating,raw_bt_conservative_rating,elo,raw_elo,glicko_rating,raw_glicko_rating,glicko_rd,conservative_rating,raw_conservative_rating,bt_anchor_shift,elo_anchor_shift,glicko_anchor_shift
+builtin:atul,builtin:atul,1,4,1500.00,1500.00,3136.6843,-4773.37,-4773.37,1500.00,1499.30,1500.00,1500.00,82.80,1334.39,1334.39,0.00,0.70,0.00
+/Users/cheukheichu/Desktop/MIT/Junior Spring/Others/pen-football-rl/checkpoints/smoke_config_yaml_c/checkpoint_256.pth,smoke_config_yaml_c_checkpoint_256.pth,0,4,2886.88,2886.88,4958.0109,-7029.14,-7029.14,1531.24,1530.54,2102.28,2102.28,105.37,1891.54,1891.54,0.00,0.70,0.00
+builtin:dummy,builtin:dummy,0,4,113.12,113.12,4958.0109,-9802.90,-9802.90,1470.87,1470.17,897.72,897.72,105.37,686.99,686.99,0.00,0.70,0.00
