@@ -3,7 +3,7 @@ command: league-stable
 name: league_stable_generalist_run5
 policy_checkpoint: checkpoints/league_stable_generalist_run4/checkpoint_119000000.pth
 
-total_steps: 25000000
+total_steps: 200000000
 rollout_len: 2048
 lr: 0.00005
 lr_end: 0.000005
