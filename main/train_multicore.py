@@ -26,7 +26,6 @@ from train import (
     sample_weighted,
     save_policy_checkpoint,
     set_optimizer_lr,
-    sync_promoted_checkpoint_to_eval,
     hard_weight,
 )
 
@@ -447,6 +446,61 @@ def build_archive_snapshot(state_archive, archive_warmup):
     return copy.deepcopy(state_archive.entries)
 
 
+def sync_promoted_checkpoint_to_eval_multicore(
+    checkpoint_path,
+    db_path,
+    target_games=0,
+    deterministic=False,
+    max_steps=600,
+    report_dir=None,
+    device="cpu",
+    run_tag=None,
+    seed=None,
+    num_workers=1,
+):
+    from eval_ratings import (
+        add_builtin_model,
+        add_checkpoint_model,
+        connect_db,
+        export_reports,
+        load_models,
+        run_scheduled_matches,
+        schedule_missing_pairs,
+    )
+
+    conn = connect_db(db_path)
+    for builtin in ("dummy", "atul"):
+        add_builtin_model(conn, builtin)
+    add_checkpoint_model(conn, checkpoint_path)
+
+    models = load_models(conn)
+    schedule = schedule_missing_pairs(
+        conn,
+        models,
+        target_games=target_games,
+        deterministic=deterministic,
+        max_steps=max_steps,
+    )
+
+    if schedule:
+        run_scheduled_matches(
+            conn,
+            schedule,
+            deterministic=deterministic,
+            max_steps=max_steps,
+            device_name=device,
+            run_tag=run_tag,
+            seed=seed,
+            num_workers=num_workers,
+        )
+
+    if report_dir:
+        export_reports(conn, report_dir, deterministic, max_steps)
+    conn.close()
+
+    return len(schedule)
+
+
 def train_league_ppo_real_multicore(
     name,
     policy,
@@ -498,6 +552,7 @@ def train_league_ppo_real_multicore(
     elo_report_dir=None,
     elo_device="cpu",
     elo_seed=None,
+    elo_num_workers=1,
     num_workers=2,
 ):
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -790,7 +845,7 @@ def train_league_ppo_real_multicore(
 
                     eval_schedule_len = None
                     if elo_sync_db is not None:
-                        eval_schedule_len = sync_promoted_checkpoint_to_eval(
+                        eval_schedule_len = sync_promoted_checkpoint_to_eval_multicore(
                             save_path,
                             db_path=elo_sync_db,
                             target_games=elo_target_games,
@@ -800,6 +855,7 @@ def train_league_ppo_real_multicore(
                             device=elo_device,
                             run_tag=f"promotion_{checkpoint_step}",
                             seed=elo_seed,
+                            num_workers=elo_num_workers,
                         )
 
                     print(
@@ -876,6 +932,7 @@ if __name__ == "__main__":
     stable_parser.add_argument("--elo-report-dir", default=None, help="Optional eval report dir to refresh after promotion sync.")
     stable_parser.add_argument("--elo-device", default="cpu")
     stable_parser.add_argument("--elo-seed", type=int, default=None)
+    stable_parser.add_argument("--elo-num-workers", type=int, default=1, help="Number of parallel workers to use for training-time Elo sync.")
     stable_parser.add_argument("--num-workers", type=int, default=2, help="Number of rollout worker processes to use.")
 
     args = parser.parse_args()
@@ -923,5 +980,6 @@ if __name__ == "__main__":
             elo_report_dir=args.elo_report_dir,
             elo_device=args.elo_device,
             elo_seed=args.elo_seed,
+            elo_num_workers=args.elo_num_workers,
             num_workers=args.num_workers,
         )

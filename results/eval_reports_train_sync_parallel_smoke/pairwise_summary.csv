@@ -1,0 +1,7 @@
+model_a,model_b,games,mean_score_a,ci_low_a,ci_high_a
+builtin:atul,smoke_multicore_elo_sync_checkpoint_256.pth,2,0.0000,0.0000,0.6576
+builtin:atul,smoke_multicore_elo_sync_checkpoint_512.pth,2,0.0000,0.0000,0.6576
+builtin:dummy,builtin:atul,2,0.0000,0.0000,0.6576
+builtin:dummy,smoke_multicore_elo_sync_checkpoint_256.pth,2,0.0000,0.0000,0.6576
+builtin:dummy,smoke_multicore_elo_sync_checkpoint_512.pth,2,0.0000,0.0000,0.6576
+smoke_multicore_elo_sync_checkpoint_256.pth,smoke_multicore_elo_sync_checkpoint_512.pth,2,0.5000,0.0945,0.9055

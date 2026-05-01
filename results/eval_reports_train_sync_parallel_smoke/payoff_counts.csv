@@ -1,0 +1,5 @@
+model,builtin:atul,builtin:dummy,smoke_multicore_elo_sync_checkpoint_256.pth,smoke_multicore_elo_sync_checkpoint_512.pth
+builtin:atul,0,2,2,2
+builtin:dummy,2,0,2,2
+smoke_multicore_elo_sync_checkpoint_256.pth,2,2,0,2
+smoke_multicore_elo_sync_checkpoint_512.pth,2,2,2,0

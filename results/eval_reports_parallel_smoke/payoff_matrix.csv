@@ -1,0 +1,5 @@
+model,builtin:atul,builtin:dummy,league_stable_generalist_run1_checkpoint_22000000.pth,league_stable_generalist_run2_checkpoint_65000000.pth
+builtin:atul,0.5000,1.0000,0.0000,0.0000
+builtin:dummy,0.0000,0.5000,0.0000,0.0000
+league_stable_generalist_run1_checkpoint_22000000.pth,1.0000,1.0000,0.5000,0.0000
+league_stable_generalist_run2_checkpoint_65000000.pth,1.0000,1.0000,1.0000,0.5000

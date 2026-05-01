@@ -1,0 +1,5 @@
+model_key,label,is_anchor,games,bt_rating,raw_bt_rating,bt_std_err,bt_conservative_rating,raw_bt_conservative_rating,elo,raw_elo,glicko_rating,raw_glicko_rating,glicko_rd,conservative_rating,raw_conservative_rating,bt_anchor_shift,elo_anchor_shift,glicko_anchor_shift
+/Users/cheukheichu/Desktop/MIT/Junior Spring/Others/pen-football-rl/checkpoints/smoke_multicore_elo_sync/checkpoint_256.pth,smoke_multicore_elo_sync_checkpoint_256.pth,0,6,2936.03,2554.84,3090.8727,-3245.71,-3626.91,1546.78,1530.48,2046.04,1869.02,50.07,1945.90,1768.88,381.20,16.30,177.02
+/Users/cheukheichu/Desktop/MIT/Junior Spring/Others/pen-football-rl/checkpoints/smoke_multicore_elo_sync/checkpoint_512.pth,smoke_multicore_elo_sync_checkpoint_512.pth,0,6,2936.03,2554.84,3090.8727,-3245.71,-3626.91,1545.57,1529.27,2046.04,1869.02,50.07,1945.90,1768.88,381.20,16.30,177.02
+builtin:atul,builtin:atul,1,6,1500.00,1118.80,3089.6538,-4679.31,-5060.51,1500.00,1483.70,1500.00,1322.98,62.62,1374.76,1197.74,381.20,16.30,177.02
+builtin:dummy,builtin:dummy,0,6,152.73,-228.47,5210.4804,-10268.23,-10649.43,1472.86,1456.56,1000.52,823.50,84.48,831.55,654.53,381.20,16.30,177.02

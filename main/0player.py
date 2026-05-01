@@ -78,8 +78,10 @@ if __name__ == "__main__":
     #     )
     play_zero_player(
         # "../checkpoints/league_ppo_real_feudal/checkpoint_29500000.pth",
-        "../checkpoints/league_ppo (misc rewards)/checkpoint_7100000.pth",
+        # "../checkpoints/league_ppo (misc rewards)/checkpoint_7100000.pth",
         # "../checkpoints/league_stable_curated_run1/checkpoint_54000000.pth",
         # "../checkpoints/league_stable_curated_run1/checkpoint_56000000.pth",
-        "../checkpoints/league_stable_generalist_run2/checkpoint_65000000.pth"
+        # "../checkpoints/league_stable_generalist_run2/checkpoint_65000000.pth",
+        "../checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_80000000.pth",
+        "../checkpoints/league_stable_generalist_run4/checkpoint_119000000.pth",
         )

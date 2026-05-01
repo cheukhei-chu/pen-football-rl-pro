@@ -1,11 +1,14 @@
 import argparse
 import csv
+import multiprocessing as mp
 import os
 import random
 import sqlite3
 import time
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass
+from multiprocessing.connection import wait as mp_wait
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -358,11 +361,25 @@ def run_scheduled_matches(
     device_name: str,
     run_tag: Optional[str],
     seed: Optional[int],
+    num_workers: int = 1,
 ) -> None:
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
+
+    if num_workers > 1:
+        run_scheduled_matches_parallel(
+            conn,
+            schedule,
+            deterministic=deterministic,
+            max_steps=max_steps,
+            device_name=device_name,
+            run_tag=run_tag,
+            seed=seed,
+            num_workers=num_workers,
+        )
+        return
 
     device = torch.device(device_name)
     model_map = load_model_map(conn)
@@ -400,6 +417,174 @@ def run_scheduled_matches(
             print(f"[EVAL] Completed {match_index}/{len(schedule)} scheduled matches")
 
     env.close()
+
+
+def serialize_model_map(model_map: Dict[int, ModelRecord]) -> Dict[int, Dict[str, object]]:
+    return {
+        model_id: {
+            "id": record.id,
+            "model_key": record.model_key,
+            "label": record.label,
+            "source_type": record.source_type,
+            "source_path": record.source_path,
+            "policy_class": record.policy_class,
+        }
+        for model_id, record in model_map.items()
+    }
+
+
+def instantiate_model_from_payload(payload: Dict[str, object], device: torch.device):
+    record = ModelRecord(**payload)
+    return instantiate_model(record, device)
+
+
+def eval_worker_main(
+    conn,
+    serialized_model_map: Dict[int, Dict[str, object]],
+    deterministic: bool,
+    max_steps: int,
+    device_name: str,
+):
+    if deterministic:
+        torch.set_grad_enabled(False)
+
+    device = torch.device(device_name)
+    env = FootballMultiAgentEnv()
+    policy_cache: Dict[int, object] = {}
+
+    try:
+        while True:
+            message = conn.recv()
+            command = message.get("command")
+
+            if command == "close":
+                break
+
+            if command != "play":
+                raise ValueError(f"Unknown worker command: {command}")
+
+            if message.get("seed") is not None:
+                task_seed = int(message["seed"])
+                random.seed(task_seed)
+                np.random.seed(task_seed)
+                torch.manual_seed(task_seed)
+
+            red_id = int(message["red_id"])
+            blue_id = int(message["blue_id"])
+
+            if red_id not in policy_cache:
+                policy_cache[red_id] = instantiate_model_from_payload(serialized_model_map[red_id], device)
+            if blue_id not in policy_cache:
+                policy_cache[blue_id] = instantiate_model_from_payload(serialized_model_map[blue_id], device)
+
+            red_score, result, steps = play_match(
+                env,
+                policy_cache[red_id],
+                policy_cache[blue_id],
+                deterministic=deterministic,
+                max_steps=max_steps,
+                device=device,
+            )
+            conn.send(
+                {
+                    "ok": True,
+                    "red_id": red_id,
+                    "blue_id": blue_id,
+                    "red_score": red_score,
+                    "result": result,
+                    "steps": steps,
+                    "seed": message.get("seed"),
+                }
+            )
+    except Exception:
+        conn.send({"ok": False, "error": traceback.format_exc()})
+    finally:
+        env.close()
+        conn.close()
+
+
+def run_scheduled_matches_parallel(
+    conn: sqlite3.Connection,
+    schedule: Sequence[Tuple[int, int]],
+    deterministic: bool,
+    max_steps: int,
+    device_name: str,
+    run_tag: Optional[str],
+    seed: Optional[int],
+    num_workers: int,
+) -> None:
+    model_map = load_model_map(conn)
+    serialized_model_map = serialize_model_map(model_map)
+    ctx = mp.get_context("spawn")
+    parent_conns = []
+    processes = []
+
+    try:
+        for _ in range(num_workers):
+            parent_conn, child_conn = ctx.Pipe()
+            process = ctx.Process(
+                target=eval_worker_main,
+                args=(child_conn, serialized_model_map, deterministic, max_steps, device_name),
+                daemon=True,
+            )
+            process.start()
+            child_conn.close()
+            parent_conns.append(parent_conn)
+            processes.append(process)
+
+        next_match_index = 0
+        completed = 0
+        in_flight: Dict[object, int] = {}
+
+        while next_match_index < len(schedule) or in_flight:
+            while next_match_index < len(schedule) and len(in_flight) < len(parent_conns):
+                conn_worker = next(conn_it for conn_it in parent_conns if conn_it not in in_flight)
+                red_id, blue_id = schedule[next_match_index]
+                match_seed = None if seed is None else seed + next_match_index
+                conn_worker.send(
+                    {
+                        "command": "play",
+                        "red_id": red_id,
+                        "blue_id": blue_id,
+                        "seed": match_seed,
+                    }
+                )
+                in_flight[conn_worker] = next_match_index
+                next_match_index += 1
+
+            ready = mp_wait(list(in_flight.keys()))
+            for conn_worker in ready:
+                response = conn_worker.recv()
+                if not response.get("ok"):
+                    raise RuntimeError(f"Eval worker failed:\n{response.get('error', 'unknown error')}")
+
+                store_match(
+                    conn,
+                    int(response["red_id"]),
+                    int(response["blue_id"]),
+                    float(response["red_score"]),
+                    str(response["result"]),
+                    int(response["steps"]),
+                    deterministic,
+                    max_steps,
+                    response.get("seed"),
+                    run_tag,
+                )
+                completed += 1
+                del in_flight[conn_worker]
+
+                if completed % 25 == 0 or completed == len(schedule):
+                    print(f"[EVAL] Completed {completed}/{len(schedule)} scheduled matches")
+    finally:
+        for conn_worker in parent_conns:
+            try:
+                conn_worker.send({"command": "close"})
+            except (BrokenPipeError, EOFError):
+                pass
+        for process in processes:
+            process.join(timeout=5.0)
+            if process.is_alive():
+                process.terminate()
 
 
 def aggregate_matches(
@@ -862,6 +1047,7 @@ def cmd_sync(args) -> None:
             device_name=args.device,
             run_tag=args.run_tag,
             seed=args.seed,
+            num_workers=args.num_workers,
         )
 
     if args.report_dir:
@@ -897,6 +1083,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--deterministic", action="store_true", help="Use argmax actions instead of sampled actions.")
     sync_parser.add_argument("--max-steps", type=int, default=600)
     sync_parser.add_argument("--device", default="cpu")
+    sync_parser.add_argument("--num-workers", type=int, default=1, help="Number of parallel match workers to use.")
     sync_parser.add_argument("--run-tag", default=None)
     sync_parser.add_argument("--seed", type=int, default=None)
     sync_parser.add_argument("--report-dir", default=None, help="If provided, export reports after syncing.")
