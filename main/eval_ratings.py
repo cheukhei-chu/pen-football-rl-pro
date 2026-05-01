@@ -56,6 +56,15 @@ ON matches(blue_model_id, red_model_id, deterministic, max_steps);
 
 
 Q = np.log(10.0) / 400.0
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RELATIVE_PATH_MARKERS = (
+    "checkpoints/",
+    "results/",
+    "configs/",
+    "docs/",
+    "samples/",
+    "main/",
+)
 
 
 @dataclass(frozen=True)
@@ -73,7 +82,96 @@ def connect_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(DB_SCHEMA)
+    normalize_registered_checkpoint_paths(conn)
     return conn
+
+
+def normalize_path_separators(path: str) -> str:
+    return path.replace("\\", "/")
+
+
+def infer_repo_relative_path(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+
+    normalized = normalize_path_separators(path)
+    if os.path.isabs(path):
+        try:
+            rel_path = os.path.relpath(path, REPO_ROOT)
+        except ValueError:
+            rel_path = None
+        if rel_path is not None and not rel_path.startswith(".."):
+            return normalize_path_separators(rel_path)
+
+    for marker in RELATIVE_PATH_MARKERS:
+        idx = normalized.find(marker)
+        if idx != -1:
+            return normalized[idx:]
+
+    if not os.path.isabs(path):
+        return normalized
+    return None
+
+
+def canonical_checkpoint_ref(path: str) -> str:
+    rel_path = infer_repo_relative_path(path)
+    if rel_path is not None:
+        return rel_path
+    return normalize_path_separators(os.path.abspath(path))
+
+
+def resolve_repo_path(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+
+    rel_path = infer_repo_relative_path(path)
+    if rel_path is not None:
+        candidate = os.path.join(REPO_ROOT, rel_path)
+        return os.path.abspath(candidate)
+
+    return os.path.abspath(path)
+
+
+def normalize_registered_checkpoint_paths(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, model_key, source_path
+        FROM models
+        WHERE source_type = 'checkpoint'
+        """
+    ).fetchall()
+
+    for row in rows:
+        new_key = canonical_checkpoint_ref(row["model_key"] or row["source_path"])
+        new_source = canonical_checkpoint_ref(row["source_path"] or row["model_key"])
+        if new_key == row["model_key"] and new_source == row["source_path"]:
+            continue
+
+        conflict = conn.execute(
+            "SELECT id FROM models WHERE model_key = ? AND id != ?",
+            (new_key, row["id"]),
+        ).fetchone()
+        if conflict is not None:
+            conn.execute(
+                """
+                UPDATE models
+                SET source_path = ?
+                WHERE id = ?
+                """,
+                (new_source, row["id"]),
+            )
+            continue
+
+        conn.execute(
+            """
+            UPDATE models
+            SET model_key = ?, source_path = ?
+            WHERE id = ?
+            """,
+            (new_key, new_source, row["id"]),
+        )
+
+    conn.commit()
 
 
 def extract_epoch_from_filename(fname: str) -> Optional[int]:
@@ -130,13 +228,14 @@ def add_builtin_model(conn: sqlite3.Connection, name: str) -> None:
 
 
 def add_checkpoint_model(conn: sqlite3.Connection, path: str, label: Optional[str] = None) -> None:
-    abs_path = os.path.abspath(path)
-    if not os.path.exists(abs_path):
-        raise FileNotFoundError(abs_path)
+    resolved_path = resolve_repo_path(path)
+    if resolved_path is None or not os.path.exists(resolved_path):
+        raise FileNotFoundError(path)
 
-    policy, checkpoint = policy_from_checkpoint_path(abs_path)
+    policy, checkpoint = policy_from_checkpoint_path(resolved_path)
     policy_class = checkpoint.get("policy_class") or checkpoint.get("policy_name") or policy.__class__.__name__
-    model_label = label or checkpoint_label(abs_path)
+    model_label = label or checkpoint_label(resolved_path)
+    model_key = canonical_checkpoint_ref(resolved_path)
 
     conn.execute(
         """
@@ -147,7 +246,7 @@ def add_checkpoint_model(conn: sqlite3.Connection, path: str, label: Optional[st
             source_path=excluded.source_path,
             policy_class=excluded.policy_class
         """,
-        (abs_path, model_label, abs_path, policy_class, time.time()),
+        (model_key, model_label, model_key, policy_class, time.time()),
     )
     conn.commit()
 
@@ -165,6 +264,25 @@ def load_models(conn: sqlite3.Connection) -> List[ModelRecord]:
 
 def load_model_map(conn: sqlite3.Connection) -> Dict[int, ModelRecord]:
     return {model.id: model for model in load_models(conn)}
+
+
+def validate_model_sources(models: Sequence[ModelRecord]) -> None:
+    missing = []
+    for model in models:
+        if model.source_type != "checkpoint":
+            continue
+        resolved_path = resolve_repo_path(model.source_path)
+        if not resolved_path or not os.path.exists(resolved_path):
+            missing.append((model.label, model.source_path))
+
+    if missing:
+        lines = ["Some registered checkpoint models no longer exist on disk:"]
+        for label, path in missing[:20]:
+            lines.append(f"- {label}: {path}")
+        if len(missing) > 20:
+            lines.append(f"... and {len(missing) - 20} more")
+        lines.append("Re-register the pool without those entries or use a fresh eval DB.")
+        raise FileNotFoundError("\n".join(lines))
 
 
 def reset_policy_state(policy) -> None:
@@ -201,7 +319,8 @@ def instantiate_model(record: ModelRecord, device: torch.device):
         policy.eval()
         return policy
 
-    policy, _ = policy_from_checkpoint_path(record.source_path)
+    resolved_path = resolve_repo_path(record.source_path)
+    policy, _ = policy_from_checkpoint_path(resolved_path)
     policy.to(device)
     policy.eval()
     return policy
@@ -381,8 +500,9 @@ def run_scheduled_matches(
         )
         return
 
-    device = torch.device(device_name)
     model_map = load_model_map(conn)
+    validate_model_sources(model_map.values())
+    device = torch.device(device_name)
     policy_cache: Dict[int, object] = {}
     env = FootballMultiAgentEnv()
 
@@ -514,6 +634,7 @@ def run_scheduled_matches_parallel(
     num_workers: int,
 ) -> None:
     model_map = load_model_map(conn)
+    validate_model_sources(model_map.values())
     serialized_model_map = serialize_model_map(model_map)
     ctx = mp.get_context("spawn")
     parent_conns = []
@@ -849,9 +970,11 @@ def is_anchor_model(model: ModelRecord) -> bool:
     if model.source_path is None:
         return False
 
-    normalized = model.source_path.replace("\\", "/")
+    normalized = normalize_path_separators(model.source_path)
     return (
-        "/checkpoints/elo_tournament_baseline/" in normalized
+        normalized.startswith("checkpoints/elo_tournament_baseline/")
+        or normalized.startswith("checkpoints/elo_tournament_test/")
+        or "/checkpoints/elo_tournament_baseline/" in normalized
         or "/checkpoints/elo_tournament_test/" in normalized
     )
 
