@@ -1,7 +1,7 @@
 Ratings are anchored so the mean rating of the anchor set is 1500.00.
-Bradley-Terry anchor shift applied: 300.902823
-Elo anchor shift applied: 416.040152
-Glicko anchor shift applied: 302.225320
+Bradley-Terry anchor shift applied: 311.790804
+Elo anchor shift applied: 403.219463
+Glicko anchor shift applied: 312.705892
 Anchor count: 21
 Anchor models:
 - builtin:atul
