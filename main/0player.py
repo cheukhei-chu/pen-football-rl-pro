@@ -82,6 +82,7 @@ if __name__ == "__main__":
         # "../checkpoints/league_stable_curated_run1/checkpoint_54000000.pth",
         # "../checkpoints/league_stable_curated_run1/checkpoint_56000000.pth",
         # "../checkpoints/league_stable_generalist_run2/checkpoint_65000000.pth",
-        "../checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_80000000.pth",
+        # "../checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_80000000.pth",
         "../checkpoints/league_stable_generalist_run4/checkpoint_119000000.pth",
+        "../checkpoints/league_stable_generalist_run5/checkpoint_138000000.pth",
         )

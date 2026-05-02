@@ -90,4 +90,5 @@ if __name__ == "__main__":
     # play_one_player("../checkpoints/league_stable_generalist_run1/checkpoint_22000000.pth")
     # play_one_player("../checkpoints/league_stable_generalist_run2/checkpoint_65000000.pth")
     # play_one_player("../checkpoints/league_stable_generalist_run3_resume_2w/checkpoint_80000000.pth")
-    play_one_player("../checkpoints/league_stable_generalist_run4/checkpoint_119000000.pth")
+    # play_one_player("../checkpoints/league_stable_generalist_run4/checkpoint_119000000.pth")
+    play_one_player("../checkpoints/league_stable_generalist_run5/checkpoint_138000000.pth")
