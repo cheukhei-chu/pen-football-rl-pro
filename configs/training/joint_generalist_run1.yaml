@@ -1,0 +1,75 @@
+command: league-stable
+
+name: league_joint_generalist_run1
+policy_class: JointActorCriticMLPPolicy
+policy_kwargs: {}
+
+total_steps: 30000000
+rollout_len: 2048
+lr: 0.0001
+lr_end: 0.00001
+epochs: 10
+batch_size: 256
+pool_size: 200
+print_every: 10000
+save_every: 1000000
+
+promotion_games: 80
+benchmark_games: 40
+historical_eval_opponents: 12
+historical_eval_games: 12
+historical_eval_stratified: true
+promotion_threshold: 0.55
+benchmark_threshold: 0.55
+historical_threshold: 0.52
+target_kl: 0.02
+max_grad_norm: 0.5
+vf_clip_ratio: 0.2
+ent_coef_start: 0.01
+ent_coef_end: 0.001
+
+fixed_benchmarks:
+  - dummy
+  - atul
+
+fixed_opponent_prob: 0.20
+champion_prob: 0.15
+recent_prob: 0.15
+easy_opponent_prob: 0.10
+pfsp_prob: 0.20
+hard_prob: 0.20
+easy_threshold: 0.70
+hard_threshold: 0.30
+
+archive_reset_prob: 0.0
+archive_capacity: 5000
+archive_alpha: 0.7
+archive_min_priority: 0.05
+archive_warmup: 500
+archive_min_step: 15
+archive_stride: 4
+
+elo_sync_db: results/eval_ratings_stochastic.sqlite
+elo_target_games: 40
+elo_max_steps: 600
+elo_report_dir: results/eval_reports/stochastic
+elo_device: cpu
+elo_num_workers: 2
+
+num_workers: 3
+
+seed_pool:
+  - checkpoints/league_stable_curated_run1/checkpoint_54000000.pth
+  - checkpoints/league_stable_curated_run1/checkpoint_56000000.pth
+  - checkpoints/league_stable_generalist_run4/checkpoint_83000000.pth
+  - checkpoints/league_stable_generalist_run4/checkpoint_115000000.pth
+  - checkpoints/league_stable_generalist_run5/checkpoint_117000000.pth
+  - checkpoints/league_stable_generalist_run5/checkpoint_127000000.pth
+  - checkpoints/league_stable_generalist_run5/checkpoint_138000000.pth
+  - checkpoints/league_stable_generalist_run6/checkpoint_11000000.pth
+  - checkpoints/league_stable_generalist_run6/checkpoint_133000000.pth
+  - checkpoints/elo_tournament_baseline/league_ppo (misc rewards)_checkpoint_7100000.pth
+  - checkpoints/elo_tournament_baseline/league_ppo (score reward)_checkpoint_22000000.pth
+  - checkpoints/elo_tournament_test/league_ppo_score_checkpoint_10000000.pth
+  - checkpoints/elo_tournament_test/league_ppo_score_checkpoint_20000000.pth
+  - checkpoints/elo_tournament_test/league_ppo_score_checkpoint_30000000.pth
