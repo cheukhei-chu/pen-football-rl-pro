@@ -12,8 +12,10 @@ class FootballPolicy(nn.Module, ABC):
     """
     Abstract base class for football policies.
     Subclasses must implement forward() and sample_action().
-    forward() must return a dict containing:
-        - "left", "right", "jump": logits (un-normalized) for each discrete action
+    forward() must return a dict containing either:
+        - "left", "right", "jump": logits (un-normalized) for each discrete action, or
+        - "action": logits over a joint discrete action space
+    and always:
         - "value": a (batch, 1) tensor of state values
     """
     def __init__(self):
@@ -42,6 +44,98 @@ def _to_tensor(obs):
         return t.float()
     else:
         return torch.tensor(np.asarray(obs), dtype=torch.float32).unsqueeze(0)
+
+
+ACTION_KEYS = ("left", "right", "jump")
+JOINT_ACTIONS = (
+    {"left": 0, "right": 0, "jump": 0},
+    {"left": 1, "right": 0, "jump": 0},
+    {"left": 0, "right": 1, "jump": 0},
+    {"left": 0, "right": 0, "jump": 1},
+    {"left": 1, "right": 0, "jump": 1},
+    {"left": 0, "right": 1, "jump": 1},
+)
+JOINT_ACTION_LOOKUP = {
+    tuple(int(action[key]) for key in ACTION_KEYS): idx
+    for idx, action in enumerate(JOINT_ACTIONS)
+}
+
+
+def uses_joint_action(policy_or_logits) -> bool:
+    if isinstance(policy_or_logits, dict):
+        return "action" in policy_or_logits
+    return getattr(policy_or_logits, "action_head_type", "factorized") == "joint"
+
+
+def empty_action_storage(policy) -> dict:
+    if uses_joint_action(policy):
+        return {"action": []}
+    return {key: [] for key in ACTION_KEYS}
+
+
+def clone_action_dict(action_dict):
+    return {key: int(action_dict[key]) for key in ACTION_KEYS}
+
+
+def joint_action_index_to_dict(index: int) -> dict:
+    return clone_action_dict(JOINT_ACTIONS[int(index)])
+
+
+def joint_action_dict_to_index(action_dict) -> int:
+    key = tuple(int(action_dict[action_key]) for action_key in ACTION_KEYS)
+    if key not in JOINT_ACTION_LOOKUP:
+        raise ValueError(f"Unsupported joint action combination: {action_dict}")
+    return JOINT_ACTION_LOOKUP[key]
+
+
+def sample_action_from_logits(logits: dict):
+    if "action" in logits:
+        dist = torch.distributions.Categorical(logits=logits["action"])
+        sampled = dist.sample()
+        action_index = int(sampled[0].item())
+        return (
+            joint_action_index_to_dict(action_index),
+            {"action": action_index},
+            float(dist.log_prob(sampled)[0].item()),
+        )
+
+    action = {}
+    action_record = {}
+    logp = 0.0
+    for key in ACTION_KEYS:
+        dist = torch.distributions.Categorical(logits=logits[key])
+        sampled = dist.sample()
+        action_value = int(sampled[0].item())
+        action[key] = action_value
+        action_record[key] = action_value
+        logp += float(dist.log_prob(sampled)[0].item())
+    return action, action_record, logp
+
+
+def deterministic_action_from_logits(logits: dict):
+    if "action" in logits:
+        action_index = int(torch.argmax(logits["action"], dim=-1)[0].item())
+        return joint_action_index_to_dict(action_index)
+
+    return {
+        key: int(torch.argmax(logits[key], dim=-1)[0].item())
+        for key in ACTION_KEYS
+    }
+
+
+def action_log_prob_and_entropy(logits: dict, actions: dict):
+    if "action" in logits:
+        dist = torch.distributions.Categorical(logits=logits["action"])
+        action_tensor = actions["action"]
+        return dist.log_prob(action_tensor), dist.entropy()
+
+    logps = []
+    entropies = []
+    for key in ACTION_KEYS:
+        dist = torch.distributions.Categorical(logits=logits[key])
+        logps.append(dist.log_prob(actions[key]))
+        entropies.append(dist.entropy())
+    return sum(logps), sum(entropies)
 
 
 # -------------------------
@@ -480,6 +574,40 @@ class ActorCriticMLPPolicy(FootballPolicy):
         pass
 
 
+class JointActorCriticMLPPolicy(FootballPolicy):
+    def __init__(self, latent_dims=[128, 128], obs_dim=12, action_dim=None):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.action_head_type = "joint"
+        self.action_dim = action_dim or len(JOINT_ACTIONS)
+
+        dims = [obs_dim] + latent_dims
+        layers = []
+        for idx in range(len(latent_dims)):
+            layers.append(nn.Linear(dims[idx], dims[idx + 1]))
+            layers.append(nn.ReLU())
+        self.action_net = nn.Sequential(*layers)
+        self.action_head = nn.Linear(latent_dims[-1], self.action_dim)
+        self.value_head = nn.Linear(latent_dims[-1], 1)
+
+    def forward(self, obs: torch.Tensor):
+        x = self.action_net(obs)
+        return {
+            "action": self.action_head(x),
+            "value": self.value_head(x),
+        }
+
+    def sample_action(self, obs):
+        obs_t = _to_tensor(obs)
+        with torch.no_grad():
+            logits = self.forward(obs_t)
+            action, _, _ = sample_action_from_logits(logits)
+        return action
+
+    def set_setting(self, setting):
+        pass
+
+
 class FeudalMarkovPolicy(FootballPolicy):
     def __init__(self, obs_dim=12, goal_dim=16, hidden_dim=128, horizon=10):
         super().__init__()
@@ -736,6 +864,7 @@ def make_policy(class_name, **kwargs):
         "atulPolicy": atulPolicy,
         "CurriculumMLPPolicyScaled": CurriculumMLPPolicyScaled,
         "ActorCriticMLPPolicy": ActorCriticMLPPolicy,
+        "JointActorCriticMLPPolicy": JointActorCriticMLPPolicy,
         "FeudalMarkovPolicy": FeudalMarkovPolicy,
     }
     if class_name in name_to_class:

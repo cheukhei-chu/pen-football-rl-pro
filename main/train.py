@@ -168,17 +168,7 @@ def ppo_loss(
 ):
 
     logits = policy.forward(obs)
-
-    logps = []
-    entropies = []
-
-    for k in ["left", "right", "jump"]:
-        dist = torch.distributions.Categorical(logits=logits[k])
-        logps.append(dist.log_prob(actions[k]))
-        entropies.append(dist.entropy())
-
-    logp = sum(logps)                # shape (batch,)
-    entropy = sum(entropies)         # shape (batch,)
+    logp, entropy = action_log_prob_and_entropy(logits, actions)
 
     # Ensure old_logps, advantages, returns are tensors of matching shape
     # ratio shape: (batch,)
@@ -222,7 +212,7 @@ def rollout(env, policy_red, policy_blue, select_drill,
             reset_sampler=None, capture_states=False):
 
     obs_list = []
-    act_list = {"left": [], "right": [], "jump": []}
+    act_list = empty_action_storage(policy_red)
     logp_list = []
     rew_list = []
     done_list = []
@@ -278,17 +268,7 @@ def rollout(env, policy_red, policy_blue, select_drill,
             logits = policy_red.forward(obs_tensor)
             value = logits["value"].item()
 
-            # sample red action
-            a = {
-                k: torch.distributions.Categorical(logits=logits[k]).sample().item()
-                for k in ["left", "right", "jump"]
-            }
-
-            # compute log probability
-            logp = 0.0
-            for k in ["left", "right", "jump"]:
-                dist = torch.distributions.Categorical(logits=logits[k])
-                logp += dist.log_prob(torch.tensor(a[k])).item()
+            a, action_record, logp = sample_action_from_logits(logits)
 
             # environment step
             next_obs, rewards, terminated, truncated, info = env.step({
@@ -314,8 +294,8 @@ def rollout(env, policy_red, policy_blue, select_drill,
 
             # store transition
             obs_list.append(obs_tensor)            # list of (1, obs_dim) tensors
-            for k in a:
-                act_list[k].append(a[k])           # list of ints
+            for key, value in action_record.items():
+                act_list[key].append(value)
             logp_list.append(logp)                 # list of floats
             rew_list.append(r_worker)              # list of floats
             done_list.append(done)                 # list of bools

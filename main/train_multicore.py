@@ -13,7 +13,14 @@ import torch
 import torch.optim as optim
 import yaml
 
-from policy import DummyPolicy, atulPolicy, make_policy, policy_from_checkpoint_path
+from policy import (
+    DummyPolicy,
+    atulPolicy,
+    empty_action_storage,
+    make_policy,
+    policy_from_checkpoint_path,
+    sample_action_from_logits,
+)
 from train import (
     StateArchive,
     compute_gae,
@@ -78,7 +85,7 @@ def worker_rollout(
     capture_states,
 ):
     obs_rows = []
-    act_list = {"left": [], "right": [], "jump": []}
+    act_list = empty_action_storage(policy_red)
     logp_list = []
     rew_list = []
     done_list = []
@@ -135,13 +142,7 @@ def worker_rollout(
                 logits = policy_red.forward(obs_tensor)
                 value = logits["value"].item()
 
-                action = {}
-                logp = 0.0
-                for key in ("left", "right", "jump"):
-                    dist = torch.distributions.Categorical(logits=logits[key])
-                    sampled = int(dist.sample()[0].item())
-                    action[key] = sampled
-                    logp += dist.log_prob(torch.tensor(sampled)).item()
+                action, action_record, logp = sample_action_from_logits(logits)
 
             next_obs, rewards, terminated, truncated, info = env.step(
                 {
@@ -164,8 +165,8 @@ def worker_rollout(
                 m_logp_list.append(curr_m_logp.cpu().numpy())
 
             obs_rows.append(obs["player_red"])
-            for key in action:
-                act_list[key].append(action[key])
+            for key, value in action_record.items():
+                act_list[key].append(value)
             logp_list.append(logp)
             rew_list.append(r_worker)
             done_list.append(done)
@@ -381,9 +382,10 @@ def merge_worker_results(results):
         raise ValueError("No rollout results to merge.")
 
     obs_chunks = [torch.tensor(result["obs"], dtype=torch.float32) for result in results if len(result["obs"]) > 0]
+    action_keys = list(results[0]["acts"].keys())
     merged = {
         "obs": torch.cat(obs_chunks, dim=0),
-        "acts": {"left": [], "right": [], "jump": []},
+        "acts": {key: [] for key in action_keys},
         "logp": [],
         "rew": [],
         "done": [],
@@ -407,7 +409,7 @@ def merge_worker_results(results):
         }
 
     for result in results:
-        for key in merged["acts"]:
+        for key in action_keys:
             merged["acts"][key].extend(result["acts"][key])
         merged["logp"].extend(result["logp"])
         merged["rew"].extend(result["rew"])
@@ -483,6 +485,20 @@ def build_parser():
     stable_parser.add_argument("--ent-coef-end", type=float, default=0.001)
     stable_parser.add_argument("--fixed-benchmarks", nargs="*", default=["dummy", "atul"])
     stable_parser.add_argument("--seed-pool", nargs="*", default=[], help="Optional list of checkpoint paths to seed the historical pool.")
+    stable_parser.add_argument("--fixed-opponent-prob", type=float, default=0.20)
+    stable_parser.add_argument("--champion-prob", type=float, default=0.15)
+    stable_parser.add_argument("--recent-prob", type=float, default=0.15)
+    stable_parser.add_argument("--easy-opponent-prob", type=float, default=0.10)
+    stable_parser.add_argument("--pfsp-prob", type=float, default=0.20)
+    stable_parser.add_argument("--hard-prob", type=float, default=0.20)
+    stable_parser.add_argument("--easy-threshold", type=float, default=0.70)
+    stable_parser.add_argument("--hard-threshold", type=float, default=0.30)
+    stable_parser.add_argument(
+        "--historical-eval-stratified",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use stratified easy/balanced/hard opponent buckets for promotion-time historical evaluation.",
+    )
     stable_parser.add_argument("--save-rejected-checkpoints", action="store_true")
     stable_parser.add_argument("--archive-reset-prob", type=float, default=0.30)
     stable_parser.add_argument("--archive-capacity", type=int, default=5000)
@@ -675,16 +691,20 @@ def train_league_ppo_real_multicore(
     eval_win_window=20,
     opponent_pool=None,
     fixed_benchmarks=("dummy", "atul"),
-    fixed_opponent_prob=0.15,
-    champion_prob=0.20,
+    fixed_opponent_prob=0.20,
+    champion_prob=0.15,
     recent_prob=0.15,
-    pfsp_prob=0.30,
+    easy_opponent_prob=0.10,
+    pfsp_prob=0.20,
     hard_prob=0.20,
+    easy_threshold=0.70,
+    hard_threshold=0.30,
     recent_window=12,
     promotion_games=40,
     benchmark_games=20,
     historical_eval_opponents=4,
     historical_eval_games=10,
+    historical_eval_stratified=True,
     promotion_threshold=0.55,
     benchmark_threshold=0.50,
     historical_threshold=0.50,
@@ -783,10 +803,57 @@ def train_league_ppo_real_multicore(
             policy_cache.pop(removable, None)
             win_history.pop(removable, None)
 
+    def split_historical_candidates(candidates):
+        easy_candidates = []
+        balanced_candidates = []
+        hard_candidates = []
+
+        for candidate_path in candidates:
+            score = mean_score_against(candidate_path)
+            if score >= easy_threshold:
+                easy_candidates.append(candidate_path)
+            elif score <= hard_threshold:
+                hard_candidates.append(candidate_path)
+            else:
+                balanced_candidates.append(candidate_path)
+
+        return easy_candidates, balanced_candidates, hard_candidates
+
+    def sample_stratified_candidates(candidates, sample_size):
+        if sample_size <= 0 or not candidates:
+            return []
+
+        easy_candidates, balanced_candidates, hard_candidates = split_historical_candidates(candidates)
+        bucket_specs = [
+            (hard_candidates, max(1, sample_size // 4)),
+            (balanced_candidates, max(1, sample_size // 2)),
+            (easy_candidates, max(1, sample_size // 4)),
+        ]
+
+        selected = []
+        selected_set = set()
+        for bucket, target_count in bucket_specs:
+            available = [path for path in bucket if path not in selected_set]
+            if not available:
+                continue
+            chosen = random.sample(available, min(target_count, len(available)))
+            selected.extend(chosen)
+            selected_set.update(chosen)
+
+        if len(selected) < sample_size:
+            remaining = [path for path in candidates if path not in selected_set]
+            if remaining:
+                selected.extend(random.sample(remaining, min(sample_size - len(selected), len(remaining))))
+
+        if len(selected) > sample_size:
+            selected = selected[:sample_size]
+        return selected
+
     def select_opponent_identifier():
         categories = []
         historical_candidates = [path for path in historical_pool if path != champion_path]
         recent_candidates = [path for path in recent_promotions if path != champion_path]
+        easy_candidates, balanced_candidates, hard_candidates = split_historical_candidates(historical_candidates)
 
         if fixed_opponents:
             categories.append(("fixed", fixed_opponent_prob))
@@ -794,8 +861,13 @@ def train_league_ppo_real_multicore(
             categories.append(("champion", champion_prob))
         if recent_candidates:
             categories.append(("recent", recent_prob))
-        if historical_candidates:
+        if easy_candidates:
+            categories.append(("easy", easy_opponent_prob))
+        if balanced_candidates:
             categories.append(("pfsp", pfsp_prob))
+        if hard_candidates:
+            categories.append(("hard", hard_prob))
+        elif historical_candidates:
             categories.append(("hard", hard_prob))
 
         if not categories:
@@ -812,12 +884,17 @@ def train_league_ppo_real_multicore(
             return champion_path
         if category == "recent":
             return random.choice(recent_candidates)
+        if category == "easy":
+            weights = [max(1e-3, mean_score_against(path)) for path in easy_candidates]
+            return sample_weighted(easy_candidates, weights)
         if category == "pfsp":
-            weights = [pfsp_weight(mean_score_against(path)) for path in historical_candidates]
-            return sample_weighted(historical_candidates, weights)
+            candidates = balanced_candidates if balanced_candidates else historical_candidates
+            weights = [pfsp_weight(mean_score_against(path)) for path in candidates]
+            return sample_weighted(candidates, weights)
         if category == "hard":
-            weights = [hard_weight(mean_score_against(path)) for path in historical_candidates]
-            return sample_weighted(historical_candidates, weights)
+            candidates = hard_candidates if hard_candidates else historical_candidates
+            weights = [hard_weight(mean_score_against(path)) for path in candidates]
+            return sample_weighted(candidates, weights)
         return None
 
     def evaluate_for_promotion(step):
@@ -860,7 +937,10 @@ def train_league_ppo_real_multicore(
         historical_candidates = [path for path in historical_pool if path != champion_path]
         if historical_candidates:
             sample_size = min(historical_eval_opponents, len(historical_candidates))
-            sampled_paths = random.sample(historical_candidates, sample_size)
+            if historical_eval_stratified:
+                sampled_paths = sample_stratified_candidates(historical_candidates, sample_size)
+            else:
+                sampled_paths = random.sample(historical_candidates, sample_size)
             historical_scores = []
             for opponent_path in sampled_paths:
                 opponent_policy = load_policy_cached(opponent_path, fixed_opponents, policy_cache)
@@ -1075,7 +1155,16 @@ if __name__ == "__main__":
             ent_coef_end=args.ent_coef_end,
             fixed_benchmarks=tuple(args.fixed_benchmarks),
             opponent_pool=args.seed_pool,
+            fixed_opponent_prob=args.fixed_opponent_prob,
+            champion_prob=args.champion_prob,
+            recent_prob=args.recent_prob,
+            easy_opponent_prob=args.easy_opponent_prob,
+            pfsp_prob=args.pfsp_prob,
+            hard_prob=args.hard_prob,
+            easy_threshold=args.easy_threshold,
+            hard_threshold=args.hard_threshold,
             save_rejected_checkpoints=args.save_rejected_checkpoints,
+            historical_eval_stratified=args.historical_eval_stratified,
             archive_reset_prob=args.archive_reset_prob,
             archive_capacity=args.archive_capacity,
             archive_alpha=args.archive_alpha,

@@ -15,7 +15,13 @@ import numpy as np
 import torch
 
 from multiagent import FootballMultiAgentEnv
-from policy import DummyPolicy, atulPolicy, make_policy, policy_from_checkpoint_path
+from policy import (
+    DummyPolicy,
+    atulPolicy,
+    deterministic_action_from_logits,
+    make_policy,
+    policy_from_checkpoint_path,
+)
 
 
 DB_SCHEMA = """
@@ -300,10 +306,7 @@ def deterministic_action(policy, obs, device: torch.device) -> Dict[str, int]:
         if hasattr(policy, "_update_manager"):
             policy._update_manager(obs_t)
         logits = policy.forward(obs_t)
-        return {
-            key: int(torch.argmax(logits[key], dim=-1)[0].item())
-            for key in ("left", "right", "jump")
-        }
+        return deterministic_action_from_logits(logits)
 
 
 def policy_action(policy, obs, deterministic: bool, device: torch.device) -> Dict[str, int]:
